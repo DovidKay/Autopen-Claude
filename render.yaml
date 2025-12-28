@@ -1,0 +1,10 @@
+# render.yaml - Render Blueprint for Lease Signer API
+services:
+  - type: web
+    name: lease-signer-api
+    runtime: docker
+    plan: starter  # Change to 'standard' if you need more resources
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: 8000
