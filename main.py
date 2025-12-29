@@ -10,6 +10,7 @@ DataMatrix codes expected:
 import io
 import os
 import uuid
+import json
 import threading
 import concurrent.futures
 from typing import Optional
@@ -586,9 +587,10 @@ async def debug_visual(
                 'scale': scale,
             }
             
+            data_json = json.dumps(data_info)
             overlay = f'''<div class="code-overlay {code_type}" 
                  style="left:{pixel_left}px; top:{pixel_top}px; width:{pixel_width}px; height:{pixel_height}px;"
-                 data-info='{json.dumps(data_info)}'
+                 data-info='{data_json}'
                  title="{code}"></div>'''
             overlays.append(overlay)
         
