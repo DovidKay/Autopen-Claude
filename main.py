@@ -11,6 +11,7 @@ import io
 import os
 import uuid
 import threading
+import concurrent.futures
 from typing import Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import Response
@@ -29,11 +30,14 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Lease Signer API",
     description="Detects DataMatrix signature markers in PDFs and applies signatures",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 # In-memory job storage
 jobs = {}
+
+# Timeout for processing each page (seconds)
+PAGE_TIMEOUT = 30
 
 # Signature code mappings
 TENANT_SIGNATURE_CODES = {
@@ -93,6 +97,24 @@ def convert_single_page(pdf_bytes: bytes, page_num: int, dpi: int = 200) -> Imag
         last_page=page_num
     )
     return images[0] if images else None
+
+
+def process_page_with_timeout(pdf_bytes: bytes, page_num: int, dpi: int, timeout: int = PAGE_TIMEOUT):
+    """Process a single page with a timeout. Returns (image, codes) or (None, []) on timeout."""
+    def do_work():
+        image = convert_single_page(pdf_bytes, page_num, dpi)
+        if image:
+            codes = find_datamatrix_codes(image, dpi=dpi)
+            return image, codes
+        return None, []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(do_work)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"Page {page_num} timed out after {timeout}s")
+            return None, []
 
 
 def create_signature_overlay(
@@ -159,19 +181,23 @@ def process_scan_job(job_id: str, pdf_bytes: bytes, dpi: int):
         total_pages = len(pdf_reader.pages)
         
         all_codes = []
+        skipped_pages = []
         
         for page_num in range(1, total_pages + 1):
             jobs[job_id]['progress'] = f"Scanning page {page_num}/{total_pages}"
             logger.info(f"Job {job_id}: Scanning page {page_num}/{total_pages}")
             
-            image = convert_single_page(pdf_bytes, page_num, dpi)
-            if image:
-                codes = find_datamatrix_codes(image, dpi=dpi)
+            image, codes = process_page_with_timeout(pdf_bytes, page_num, dpi)
+            
+            if image is None and not codes:
+                logger.warning(f"Job {job_id}: Page {page_num} skipped (timeout or error)")
+                skipped_pages.append(page_num)
+            else:
                 for code in codes:
                     code['page'] = page_num
                     all_codes.append(code)
-                # Free memory
-                del image
+                if image:
+                    del image
         
         signature_codes = [c for c in all_codes if c['data'] in ALL_SIGNATURE_CODES]
         metadata_codes = [c for c in all_codes if c['data'] not in ALL_SIGNATURE_CODES]
@@ -181,9 +207,10 @@ def process_scan_job(job_id: str, pdf_bytes: bytes, dpi: int):
             "total_pages": total_pages,
             "total_codes_found": len(all_codes),
             "signature_markers": signature_codes,
-            "metadata_codes": metadata_codes
+            "metadata_codes": metadata_codes,
+            "skipped_pages": skipped_pages
         }
-        logger.info(f"Job {job_id}: Scan completed. Found {len(all_codes)} codes.")
+        logger.info(f"Job {job_id}: Scan completed. Found {len(all_codes)} codes. Skipped pages: {skipped_pages}")
         
     except Exception as e:
         logger.error(f"Job {job_id} failed: {e}")
@@ -212,6 +239,7 @@ def process_sign_job(
         
         signatures_applied = []
         all_codes_found = []
+        skipped_pages = []
         
         for page_num in range(1, total_pages + 1):
             jobs[job_id]['progress'] = f"Processing page {page_num}/{total_pages}"
@@ -221,10 +249,14 @@ def process_sign_job(
             page_width = float(original_page.mediabox.width)
             page_height = float(original_page.mediabox.height)
             
-            image = convert_single_page(pdf_bytes, page_num, dpi)
-            if image:
-                codes = find_datamatrix_codes(image, dpi=dpi)
-                del image  # Free memory immediately
+            image, codes = process_page_with_timeout(pdf_bytes, page_num, dpi)
+            
+            if image is None and not codes:
+                logger.warning(f"Job {job_id}: Page {page_num} skipped (timeout or error)")
+                skipped_pages.append(page_num)
+            else:
+                if image:
+                    del image  # Free memory immediately
                 
                 for code in codes:
                     code['page'] = page_num
@@ -271,9 +303,10 @@ def process_sign_job(
                 {"page": c['page'], "data": c['data'], "x": round(c['x'], 2), "y": round(c['y'], 2)}
                 for c in all_codes_found
             ],
+            "skipped_pages": skipped_pages,
             "pdf_base64": pdf_base64
         }
-        logger.info(f"Job {job_id}: Signing completed. Applied {len(signatures_applied)} signatures.")
+        logger.info(f"Job {job_id}: Signing completed. Applied {len(signatures_applied)} signatures. Skipped: {skipped_pages}")
         
     except Exception as e:
         logger.error(f"Job {job_id} failed: {e}")
@@ -283,7 +316,7 @@ def process_sign_job(
 
 @app.get("/")
 def health_check():
-    return {"status": "healthy", "service": "lease-signer-api", "version": "1.1.0"}
+    return {"status": "healthy", "service": "lease-signer-api", "version": "1.2.0"}
 
 
 @app.get("/job/{job_id}")
@@ -310,11 +343,13 @@ def get_job_status(job_id: str):
 @app.post("/scan")
 async def scan_pdf_for_codes(
     pdf_file: UploadFile = File(...),
-    dpi: int = Form(default=200)
+    dpi: int = Form(default=150)
 ):
     """
     Scan a PDF and return all DataMatrix codes found.
     Returns a job_id - poll /job/{job_id} to get results.
+    
+    Note: Uses lower default DPI (150) for faster processing.
     """
     if not pdf_file.filename.lower().endswith('.pdf'):
         raise HTTPException(400, "File must be a PDF")
@@ -328,7 +363,6 @@ async def scan_pdf_for_codes(
         'result': None
     }
     
-    # Run in background thread
     thread = threading.Thread(target=process_scan_job, args=(job_id, pdf_bytes, dpi))
     thread.start()
     
@@ -344,7 +378,7 @@ async def sign_pdf(
     pdf_file: UploadFile = File(...),
     tenant_signature: Optional[UploadFile] = File(default=None),
     landlord_signature: Optional[UploadFile] = File(default=None),
-    dpi: int = Form(default=200),
+    dpi: int = Form(default=150),
     sig_width: float = Form(default=100),
     sig_height: float = Form(default=40),
     x_offset: float = Form(default=0),
@@ -353,6 +387,8 @@ async def sign_pdf(
     """
     Sign a PDF by detecting DataMatrix markers and placing signatures.
     Returns a job_id - poll /job/{job_id} to get results including base64 PDF.
+    
+    Note: Uses lower default DPI (150) for faster processing.
     """
     if not pdf_file.filename.lower().endswith('.pdf'):
         raise HTTPException(400, "File must be a PDF")
