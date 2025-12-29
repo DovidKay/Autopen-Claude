@@ -333,11 +333,39 @@ def get_job_status(job_id: str):
     }
     
     if job['status'] == 'completed':
-        response['result'] = job['result']
+        # Return result without the large pdf_base64 field
+        result_copy = {k: v for k, v in job['result'].items() if k != 'pdf_base64'}
+        result_copy['has_pdf'] = 'pdf_base64' in job['result']
+        response['result'] = result_copy
     elif job['status'] == 'failed':
         response['error'] = job.get('error', 'Unknown error')
     
     return response
+
+
+@app.get("/job/{job_id}/download")
+def download_signed_pdf(job_id: str):
+    """Download the signed PDF from a completed job."""
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+    
+    job = jobs[job_id]
+    
+    if job['status'] != 'completed':
+        raise HTTPException(400, f"Job not completed. Current status: {job['status']}")
+    
+    if 'pdf_base64' not in job.get('result', {}):
+        raise HTTPException(400, "This job does not contain a PDF (scan-only job)")
+    
+    pdf_bytes = base64.b64decode(job['result']['pdf_base64'])
+    
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename=signed_{job_id[:8]}.pdf"
+        }
+    )
 
 
 @app.post("/scan")
