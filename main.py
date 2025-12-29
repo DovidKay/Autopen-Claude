@@ -774,6 +774,28 @@ async def calibrate_signature_detection_visual(
         annotated.save(buffer, format="PNG")
         img_base64 = base64.b64encode(buffer.getvalue()).decode()
         
+        # Build table rows for details
+        details_table_rows = ""
+        for d in sig_result['details']:
+            conf_pct = f"{d['confidence']:.1%}"
+            density = f"{d['pixel_density']:.4f}"
+            region_w = d['region'][2] - d['region'][0]
+            region_h = d['region'][3] - d['region'][1]
+            details_table_rows += f"""
+                        <tr>
+                            <td>{d['code']}</td>
+                            <td class="{d['status']}">{d['status'].upper()}</td>
+                            <td>{conf_pct}</td>
+                            <td>{density}</td>
+                            <td>x:{d['region'][0]}, y:{d['region'][1]}, w:{region_w}, h:{region_h}</td>
+                        </tr>"""
+        
+        # Build list items for codes
+        codes_list_items = ""
+        for c, _ in detected_codes:
+            display_code = c[:60] + "..." if len(c) > 60 else c
+            codes_list_items += f"<li>{display_code}</li>"
+        
         html = f"""
         <!DOCTYPE html>
         <html>
@@ -827,22 +849,14 @@ async def calibrate_signature_detection_visual(
                             <th>Pixel Density</th>
                             <th>Detection Region</th>
                         </tr>
-                        {''.join(f"""
-                        <tr>
-                            <td>{d['code']}</td>
-                            <td class="{d['status']}">{d['status'].upper()}</td>
-                            <td>{d['confidence']:.1%}</td>
-                            <td>{d['pixel_density']:.4f}</td>
-                            <td>x:{d['region'][0]}, y:{d['region'][1]}, w:{d['region'][2]-d['region'][0]}, h:{d['region'][3]-d['region'][1]}</td>
-                        </tr>
-                        """ for d in sig_result['details'])}
+                        {details_table_rows}
                     </table>
                 </div>
                 
                 <div class="results">
                     <h2>All Codes Found on Page</h2>
                     <ul>
-                        {''.join(f'<li>{c[:60]}{"..." if len(c) > 60 else ""}</li>' for c, _ in detected_codes)}
+                        {codes_list_items}
                     </ul>
                 </div>
             </div>
