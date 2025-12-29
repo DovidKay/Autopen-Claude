@@ -54,29 +54,31 @@ def find_datamatrix_codes(image: Image.Image, dpi: int = 200, page_height_points
     Find and decode all DataMatrix codes in an image.
     Returns list of dicts with 'data', 'x', 'y', 'width', 'height' in PDF points.
     
-    Note: PDF coordinates have origin at bottom-left, but we need to place
-    signatures correctly, so we convert from image coords (top-left origin).
+    Note: PDF coordinates have origin at bottom-left, y increases upward.
+    Image coordinates have origin at top-left, y increases downward.
+    pylibdmtx rect.top is the TOP edge of the barcode in image coords.
     """
     decoded = decode_datamatrix(image)
     
+    scale = 72.0 / dpi
+    logger.info(f"Image size: {image.width}x{image.height} pixels, DPI: {dpi}, scale: {scale}, page_height_points: {page_height_points}")
+    
     results = []
     for dm in decoded:
-        scale = 72.0 / dpi
-        
         pixel_left = dm.rect.left
         pixel_top = dm.rect.top
         pixel_width = dm.rect.width
         pixel_height = dm.rect.height
         
         # Convert to PDF coordinates
-        # Image: origin at top-left, y increases downward
-        # PDF: origin at bottom-left, y increases upward
         pdf_x = pixel_left * scale
         
-        # Convert image y (from top) to PDF y (from bottom)
-        # PDF_y = page_height - image_y_in_points
-        image_y_points = pixel_top * scale
-        pdf_y = page_height_points - image_y_points - (pixel_height * scale)
+        # In image: pixel_top is distance from top of image to top of barcode
+        # In PDF: we want distance from bottom of page to bottom of barcode
+        # pixel_bottom_from_top = pixel_top + pixel_height
+        # pdf_y (from bottom) = page_height - pixel_bottom_from_top (in points)
+        pixel_bottom_from_top = pixel_top + pixel_height
+        pdf_y = page_height_points - (pixel_bottom_from_top * scale)
         
         pdf_width = pixel_width * scale
         pdf_height = pixel_height * scale
@@ -85,6 +87,8 @@ def find_datamatrix_codes(image: Image.Image, dpi: int = 200, page_height_points
             data = dm.data.decode('utf-8').strip()
         except:
             data = str(dm.data)
+        
+        logger.info(f"DataMatrix '{data}': pixel_top={pixel_top}, pixel_bottom={pixel_bottom_from_top}, image_height={image.height}, pct_from_top={100*pixel_bottom_from_top/image.height:.1f}%")
         
         results.append({
             'data': data,
