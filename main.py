@@ -15,15 +15,19 @@ import threading
 import concurrent.futures
 from typing import Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import Response
+from fastapi.responses import Response, HTMLResponse
 from pdf2image import convert_from_bytes
 from pylibdmtx.pylibdmtx import decode as decode_datamatrix
-from PIL import Image
+from PIL import Image, ImageDraw
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 import logging
 import base64
+import time
+
+# Import signature detection module
+from signature_detection import process_page_for_signatures, detect_if_phone_scan
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,7 +35,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Lease Signer API",
     description="Detects DataMatrix signature markers in PDFs and applies signatures",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 # In-memory job storage
@@ -331,7 +335,7 @@ def process_sign_job(
 
 @app.get("/")
 def health_check():
-    return {"status": "healthy", "service": "lease-signer-api", "version": "1.2.0"}
+    return {"status": "healthy", "service": "lease-signer-api", "version": "1.3.0"}
 
 
 @app.get("/job/{job_id}")
@@ -513,6 +517,347 @@ async def scan_pdf_sync(
     }
 
 
+@app.post("/calibrate")
+async def calibrate_signature_detection(
+    pdf: UploadFile = File(...),
+    page: Optional[int] = None
+):
+    """
+    Calibration endpoint for signature detection.
+    
+    Analyzes a PDF and returns detailed signature detection results
+    including pixel density values for threshold calibration.
+    
+    Args:
+        pdf: The PDF file to analyze
+        page: Optional - specific page number to analyze (1-indexed). 
+              If not provided, analyzes all pages with TS_* codes.
+    
+    Returns:
+        JSON with detection results for each tenant signature code found.
+    """
+    start_time = time.time()
+    
+    pdf_bytes = await pdf.read()
+    
+    try:
+        images = convert_from_bytes(pdf_bytes, dpi=150)
+        total_pages = len(images)
+        
+        results = {
+            "filename": pdf.filename,
+            "total_pages": total_pages,
+            "pages_analyzed": [],
+            "summary": {
+                "signed": [],
+                "unsigned": [],
+                "uncertain": []
+            },
+            "density_stats": {
+                "signed_densities": [],
+                "unsigned_densities": []
+            }
+        }
+        
+        if page:
+            if page < 1 or page > total_pages:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Page {page} out of range. PDF has {total_pages} pages."
+                )
+            pages_to_process = [page]
+        else:
+            pages_to_process = list(range(1, total_pages + 1))
+        
+        for page_num in pages_to_process:
+            page_image = images[page_num - 1]
+            
+            is_phone_scan = detect_if_phone_scan(page_image)
+            
+            try:
+                decoded = decode_datamatrix(page_image, timeout=10000)
+            except Exception as e:
+                results["pages_analyzed"].append({
+                    "page": page_num,
+                    "error": f"Decode error: {str(e)}"
+                })
+                continue
+            
+            if not decoded:
+                continue
+            
+            detected_codes = []
+            all_codes_found = []
+            
+            for code in decoded:
+                try:
+                    code_value = code.data.decode('utf-8')
+                    rect = (code.rect.left, code.rect.top, code.rect.width, code.rect.height)
+                    detected_codes.append((code_value, rect))
+                    all_codes_found.append({
+                        "code": code_value[:50] + "..." if len(code_value) > 50 else code_value,
+                        "position": {"x": rect[0], "y": rect[1], "width": rect[2], "height": rect[3]}
+                    })
+                except Exception as e:
+                    pass
+            
+            tenant_codes = [c for c, _ in detected_codes if c.startswith('TS_')]
+            
+            if not tenant_codes:
+                continue
+            
+            sig_result = process_page_for_signatures(
+                page_image,
+                detected_codes,
+                page_num
+            )
+            
+            page_result = {
+                "page": page_num,
+                "is_phone_scan": is_phone_scan,
+                "image_dimensions": {"width": page_image.width, "height": page_image.height},
+                "all_codes_found": all_codes_found,
+                "tenant_codes": sig_result["tenant_codes_found"],
+                "all_signed": sig_result["all_signed"],
+                "detection_details": sig_result["details"]
+            }
+            results["pages_analyzed"].append(page_result)
+            
+            for detail in sig_result["details"]:
+                summary_item = {
+                    "page": page_num,
+                    "code": detail["code"],
+                    "density": detail["pixel_density"],
+                    "confidence": detail["confidence"]
+                }
+                
+                if detail["status"] == "signed":
+                    results["summary"]["signed"].append(summary_item)
+                    results["density_stats"]["signed_densities"].append(detail["pixel_density"])
+                elif detail["status"] == "unsigned":
+                    results["summary"]["unsigned"].append(summary_item)
+                    results["density_stats"]["unsigned_densities"].append(detail["pixel_density"])
+                else:
+                    results["summary"]["uncertain"].append(summary_item)
+        
+        signed_densities = results["density_stats"]["signed_densities"]
+        unsigned_densities = results["density_stats"]["unsigned_densities"]
+        
+        results["density_stats"] = {
+            "signed": {
+                "count": len(signed_densities),
+                "min": min(signed_densities) if signed_densities else None,
+                "max": max(signed_densities) if signed_densities else None,
+                "avg": sum(signed_densities) / len(signed_densities) if signed_densities else None
+            },
+            "unsigned": {
+                "count": len(unsigned_densities),
+                "min": min(unsigned_densities) if unsigned_densities else None,
+                "max": max(unsigned_densities) if unsigned_densities else None,
+                "avg": sum(unsigned_densities) / len(unsigned_densities) if unsigned_densities else None
+            }
+        }
+        
+        if signed_densities and unsigned_densities:
+            max_unsigned = max(unsigned_densities)
+            min_signed = min(signed_densities)
+            
+            if max_unsigned < min_signed:
+                gap = min_signed - max_unsigned
+                results["recommended_thresholds"] = {
+                    "UNSIGNED_MAX_DENSITY": round(max_unsigned + (gap * 0.3), 4),
+                    "SIGNED_MIN_DENSITY": round(min_signed - (gap * 0.3), 4),
+                    "note": "Good separation between signed and unsigned"
+                }
+            else:
+                results["recommended_thresholds"] = {
+                    "warning": "Overlap between signed and unsigned densities",
+                    "max_unsigned": max_unsigned,
+                    "min_signed": min_signed,
+                    "note": "May need to adjust detection region parameters"
+                }
+        
+        results["processing_time_seconds"] = round(time.time() - start_time, 2)
+        
+        return results
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/calibrate/visual")
+async def calibrate_signature_detection_visual(
+    pdf: UploadFile = File(...),
+    page: int = Form(default=1)
+):
+    """
+    Visual calibration endpoint - returns an HTML page with annotated image
+    showing detection regions.
+    
+    Args:
+        pdf: The PDF file to analyze
+        page: Page number to visualize (1-indexed, default=1)
+    """
+    pdf_bytes = await pdf.read()
+    
+    try:
+        images = convert_from_bytes(pdf_bytes, dpi=150)
+        total_pages = len(images)
+        
+        if page < 1 or page > total_pages:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Page {page} out of range. PDF has {total_pages} pages."
+            )
+        
+        page_image = images[page - 1]
+        
+        decoded = decode_datamatrix(page_image, timeout=10000)
+        
+        if not decoded:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No DataMatrix codes found on page {page}"
+            )
+        
+        detected_codes = []
+        for code in decoded:
+            try:
+                code_value = code.data.decode('utf-8')
+                rect = (code.rect.left, code.rect.top, code.rect.width, code.rect.height)
+                detected_codes.append((code_value, rect))
+            except:
+                pass
+        
+        sig_result = process_page_for_signatures(
+            page_image,
+            detected_codes,
+            page
+        )
+        
+        annotated = page_image.copy()
+        draw = ImageDraw.Draw(annotated)
+        
+        image_height = page_image.height
+        
+        for code_value, code_rect in detected_codes:
+            code_x, code_y_from_bottom, code_width, code_height = code_rect
+            code_y_from_top = image_height - code_y_from_bottom - code_height
+            
+            draw.rectangle(
+                [code_x, code_y_from_top, code_x + code_width, code_y_from_top + code_height],
+                outline="blue",
+                width=2
+            )
+            
+            label = code_value[:20] + "..." if len(code_value) > 20 else code_value
+            draw.text((code_x, code_y_from_top - 15), label, fill="blue")
+        
+        for detail in sig_result["details"]:
+            region = detail["region"]
+            color = {
+                "signed": "green",
+                "unsigned": "red",
+                "uncertain": "orange"
+            }.get(detail["status"], "gray")
+            
+            draw.rectangle(
+                [region[0], region[1], region[2], region[3]],
+                outline=color,
+                width=3
+            )
+            
+            label = f"{detail['code']}: {detail['status']} ({detail['pixel_density']:.4f})"
+            draw.text((region[0], region[1] - 15), label, fill=color)
+        
+        buffer = io.BytesIO()
+        annotated.save(buffer, format="PNG")
+        img_base64 = base64.b64encode(buffer.getvalue()).decode()
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Signature Detection Calibration - Page {page}</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
+                h1 {{ color: #333; }}
+                .container {{ max-width: 1200px; margin: 0 auto; }}
+                .image-container {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                img {{ max-width: 100%; height: auto; }}
+                .legend {{ margin-top: 20px; padding: 15px; background: white; border-radius: 8px; }}
+                .legend-item {{ display: inline-block; margin-right: 20px; padding: 5px 10px; }}
+                .results {{ margin-top: 20px; padding: 15px; background: white; border-radius: 8px; }}
+                table {{ border-collapse: collapse; width: 100%; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                th {{ background: #f0f0f0; }}
+                .signed {{ color: green; font-weight: bold; }}
+                .unsigned {{ color: red; font-weight: bold; }}
+                .uncertain {{ color: orange; font-weight: bold; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Signature Detection Calibration</h1>
+                <p>File: {pdf.filename} | Page: {page} of {total_pages}</p>
+                
+                <div class="legend">
+                    <strong>Legend:</strong>
+                    <span class="legend-item" style="border-left: 4px solid blue; padding-left: 8px;">Blue = DataMatrix code</span>
+                    <span class="legend-item" style="border-left: 4px solid green; padding-left: 8px;">Green = Signed</span>
+                    <span class="legend-item" style="border-left: 4px solid red; padding-left: 8px;">Red = Unsigned</span>
+                    <span class="legend-item" style="border-left: 4px solid orange; padding-left: 8px;">Orange = Uncertain</span>
+                </div>
+                
+                <div class="image-container">
+                    <img src="data:image/png;base64,{img_base64}" alt="Annotated page">
+                </div>
+                
+                <div class="results">
+                    <h2>Detection Results</h2>
+                    <p><strong>Phone scan detected:</strong> {sig_result.get('is_phone_scan', False)}</p>
+                    <p><strong>Tenant codes found:</strong> {', '.join(sig_result['tenant_codes_found']) or 'None'}</p>
+                    
+                    <h3>Details</h3>
+                    <table>
+                        <tr>
+                            <th>Code</th>
+                            <th>Status</th>
+                            <th>Confidence</th>
+                            <th>Pixel Density</th>
+                            <th>Detection Region</th>
+                        </tr>
+                        {''.join(f"""
+                        <tr>
+                            <td>{d['code']}</td>
+                            <td class="{d['status']}">{d['status'].upper()}</td>
+                            <td>{d['confidence']:.1%}</td>
+                            <td>{d['pixel_density']:.4f}</td>
+                            <td>x:{d['region'][0]}, y:{d['region'][1]}, w:{d['region'][2]-d['region'][0]}, h:{d['region'][3]-d['region'][1]}</td>
+                        </tr>
+                        """ for d in sig_result['details'])}
+                    </table>
+                </div>
+                
+                <div class="results">
+                    <h2>All Codes Found on Page</h2>
+                    <ul>
+                        {''.join(f'<li>{c[:60]}{"..." if len(c) > 60 else ""}</li>' for c, _ in detected_codes)}
+                    </ul>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return HTMLResponse(content=html)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/debug")
 async def debug_visual(
     pdf: UploadFile = File(...),
@@ -523,8 +868,6 @@ async def debug_visual(
     Visual debug endpoint - returns HTML page showing detected DataMatrix codes
     with hover info displaying exact coordinates.
     """
-    from fastapi.responses import HTMLResponse
-    
     pdf_bytes = await pdf.read()
     pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
     total_pages = len(pdf_reader.pages)
