@@ -49,25 +49,35 @@ LANDLORD_SIGNATURE_CODES = {
 ALL_SIGNATURE_CODES = TENANT_SIGNATURE_CODES | LANDLORD_SIGNATURE_CODES
 
 
-def find_datamatrix_codes(image: Image.Image, dpi: int = 200) -> list[dict]:
+def find_datamatrix_codes(image: Image.Image, dpi: int = 200, page_height_points: float = 792) -> list[dict]:
     """
     Find and decode all DataMatrix codes in an image.
     Returns list of dicts with 'data', 'x', 'y', 'width', 'height' in PDF points.
+    
+    Note: PDF coordinates have origin at bottom-left, but we need to place
+    signatures correctly, so we convert from image coords (top-left origin).
     """
     decoded = decode_datamatrix(image)
     
     results = []
     for dm in decoded:
         scale = 72.0 / dpi
-        img_height = image.height
         
         pixel_left = dm.rect.left
         pixel_top = dm.rect.top
         pixel_width = dm.rect.width
         pixel_height = dm.rect.height
         
+        # Convert to PDF coordinates
+        # Image: origin at top-left, y increases downward
+        # PDF: origin at bottom-left, y increases upward
         pdf_x = pixel_left * scale
-        pdf_y = (img_height - pixel_top - pixel_height) * scale
+        
+        # Convert image y (from top) to PDF y (from bottom)
+        # PDF_y = page_height - image_y_in_points
+        image_y_points = pixel_top * scale
+        pdf_y = page_height_points - image_y_points - (pixel_height * scale)
+        
         pdf_width = pixel_width * scale
         pdf_height = pixel_height * scale
         
@@ -99,12 +109,12 @@ def convert_single_page(pdf_bytes: bytes, page_num: int, dpi: int = 200) -> Imag
     return images[0] if images else None
 
 
-def process_page_with_timeout(pdf_bytes: bytes, page_num: int, dpi: int, timeout: int = PAGE_TIMEOUT):
+def process_page_with_timeout(pdf_bytes: bytes, page_num: int, dpi: int, page_height_points: float = 792, timeout: int = PAGE_TIMEOUT):
     """Process a single page with a timeout. Returns (image, codes) or (None, []) on timeout."""
     def do_work():
         image = convert_single_page(pdf_bytes, page_num, dpi)
         if image:
-            codes = find_datamatrix_codes(image, dpi=dpi)
+            codes = find_datamatrix_codes(image, dpi=dpi, page_height_points=page_height_points)
             return image, codes
         return None, []
     
@@ -187,7 +197,11 @@ def process_scan_job(job_id: str, pdf_bytes: bytes, dpi: int):
             jobs[job_id]['progress'] = f"Scanning page {page_num}/{total_pages}"
             logger.info(f"Job {job_id}: Scanning page {page_num}/{total_pages}")
             
-            image, codes = process_page_with_timeout(pdf_bytes, page_num, dpi)
+            # Get the actual page height
+            page = pdf_reader.pages[page_num - 1]
+            page_height = float(page.mediabox.height)
+            
+            image, codes = process_page_with_timeout(pdf_bytes, page_num, dpi, page_height_points=page_height)
             
             if image is None and not codes:
                 logger.warning(f"Job {job_id}: Page {page_num} skipped (timeout or error)")
@@ -249,7 +263,7 @@ def process_sign_job(
             page_width = float(original_page.mediabox.width)
             page_height = float(original_page.mediabox.height)
             
-            image, codes = process_page_with_timeout(pdf_bytes, page_num, dpi)
+            image, codes = process_page_with_timeout(pdf_bytes, page_num, dpi, page_height_points=page_height)
             
             if image is None and not codes:
                 logger.warning(f"Job {job_id}: Page {page_num} skipped (timeout or error)")
@@ -476,9 +490,12 @@ async def scan_pdf_sync(
     all_codes = []
     
     for page_num in range(1, total_pages + 1):
+        page = pdf_reader.pages[page_num - 1]
+        page_height = float(page.mediabox.height)
+        
         image = convert_single_page(pdf_bytes, page_num, dpi)
         if image:
-            codes = find_datamatrix_codes(image, dpi=dpi)
+            codes = find_datamatrix_codes(image, dpi=dpi, page_height_points=page_height)
             for code in codes:
                 code['page'] = page_num
                 all_codes.append(code)
