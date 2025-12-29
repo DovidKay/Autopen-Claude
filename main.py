@@ -9,7 +9,8 @@ DataMatrix codes expected:
 
 import io
 import os
-import tempfile
+import uuid
+import threading
 from typing import Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import Response
@@ -20,6 +21,7 @@ from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 import logging
+import base64
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,8 +29,11 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Lease Signer API",
     description="Detects DataMatrix signature markers in PDFs and applies signatures",
-    version="1.0.0"
+    version="1.1.0"
 )
+
+# In-memory job storage
+jobs = {}
 
 # Signature code mappings
 TENANT_SIGNATURE_CODES = {
@@ -40,23 +45,16 @@ LANDLORD_SIGNATURE_CODES = {
 ALL_SIGNATURE_CODES = TENANT_SIGNATURE_CODES | LANDLORD_SIGNATURE_CODES
 
 
-def find_datamatrix_codes(image: Image.Image, dpi: int = 300) -> list[dict]:
+def find_datamatrix_codes(image: Image.Image, dpi: int = 200) -> list[dict]:
     """
     Find and decode all DataMatrix codes in an image.
     Returns list of dicts with 'data', 'x', 'y', 'width', 'height' in PDF points.
     """
-    # Convert PIL Image to format pylibdmtx expects
     decoded = decode_datamatrix(image)
     
     results = []
     for dm in decoded:
-        # dm.rect is (left, top, width, height) in pixels
-        # Convert pixels to PDF points (72 points per inch)
         scale = 72.0 / dpi
-        
-        # pylibdmtx returns rect as (left, top, width, height)
-        # but 'top' is from the top of the image in pixel coords
-        # PDF coords are from bottom-left, so we need to flip Y
         img_height = image.height
         
         pixel_left = dm.rect.left
@@ -64,7 +62,6 @@ def find_datamatrix_codes(image: Image.Image, dpi: int = 300) -> list[dict]:
         pixel_width = dm.rect.width
         pixel_height = dm.rect.height
         
-        # Convert to PDF coordinates (bottom-left origin)
         pdf_x = pixel_left * scale
         pdf_y = (img_height - pixel_top - pixel_height) * scale
         pdf_width = pixel_width * scale
@@ -81,16 +78,21 @@ def find_datamatrix_codes(image: Image.Image, dpi: int = 300) -> list[dict]:
             'y': pdf_y,
             'width': pdf_width,
             'height': pdf_height,
-            'pixel_rect': {
-                'left': pixel_left,
-                'top': pixel_top,
-                'width': pixel_width,
-                'height': pixel_height
-            }
         })
         logger.info(f"Found DataMatrix: '{data}' at PDF coords ({pdf_x:.1f}, {pdf_y:.1f})")
     
     return results
+
+
+def convert_single_page(pdf_bytes: bytes, page_num: int, dpi: int = 200) -> Image.Image:
+    """Convert a single page of a PDF to an image."""
+    images = convert_from_bytes(
+        pdf_bytes, 
+        dpi=dpi, 
+        first_page=page_num, 
+        last_page=page_num
+    )
+    return images[0] if images else None
 
 
 def create_signature_overlay(
@@ -104,27 +106,20 @@ def create_signature_overlay(
     x_offset: float = 0,
     y_offset: float = -5
 ) -> bytes:
-    """
-    Create a PDF page with signature images placed at specified locations.
-    Returns PDF bytes for a single page overlay.
-    """
+    """Create a PDF page with signature images placed at specified locations."""
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=(page_width, page_height))
     
     for sig_info in signatures_to_place:
         code = sig_info['data']
         
-        # Determine which signature image to use
         if code in TENANT_SIGNATURE_CODES and tenant_sig_image:
             sig_bytes = tenant_sig_image
         elif code in LANDLORD_SIGNATURE_CODES and landlord_sig_image:
             sig_bytes = landlord_sig_image
         else:
-            logger.warning(f"No signature image for code: {code}")
             continue
         
-        # Place signature relative to DataMatrix position
-        # Position signature to the right and slightly below the DataMatrix
         sig_x = sig_info['x'] + x_offset
         sig_y = sig_info['y'] + y_offset
         
@@ -149,15 +144,167 @@ def create_signature_overlay(
 
 
 def merge_overlay_with_page(original_page, overlay_pdf_bytes) -> None:
-    """Merge an overlay PDF onto an original page (modifies original_page in place)."""
+    """Merge an overlay PDF onto an original page."""
     overlay_reader = PdfReader(io.BytesIO(overlay_pdf_bytes))
     if len(overlay_reader.pages) > 0:
         original_page.merge_page(overlay_reader.pages[0])
 
 
+def process_scan_job(job_id: str, pdf_bytes: bytes, dpi: int):
+    """Background job to scan PDF for DataMatrix codes."""
+    try:
+        jobs[job_id]['status'] = 'processing'
+        
+        pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
+        total_pages = len(pdf_reader.pages)
+        
+        all_codes = []
+        
+        for page_num in range(1, total_pages + 1):
+            jobs[job_id]['progress'] = f"Scanning page {page_num}/{total_pages}"
+            logger.info(f"Job {job_id}: Scanning page {page_num}/{total_pages}")
+            
+            image = convert_single_page(pdf_bytes, page_num, dpi)
+            if image:
+                codes = find_datamatrix_codes(image, dpi=dpi)
+                for code in codes:
+                    code['page'] = page_num
+                    all_codes.append(code)
+                # Free memory
+                del image
+        
+        signature_codes = [c for c in all_codes if c['data'] in ALL_SIGNATURE_CODES]
+        metadata_codes = [c for c in all_codes if c['data'] not in ALL_SIGNATURE_CODES]
+        
+        jobs[job_id]['status'] = 'completed'
+        jobs[job_id]['result'] = {
+            "total_pages": total_pages,
+            "total_codes_found": len(all_codes),
+            "signature_markers": signature_codes,
+            "metadata_codes": metadata_codes
+        }
+        logger.info(f"Job {job_id}: Scan completed. Found {len(all_codes)} codes.")
+        
+    except Exception as e:
+        logger.error(f"Job {job_id} failed: {e}")
+        jobs[job_id]['status'] = 'failed'
+        jobs[job_id]['error'] = str(e)
+
+
+def process_sign_job(
+    job_id: str,
+    pdf_bytes: bytes,
+    tenant_sig_bytes: Optional[bytes],
+    landlord_sig_bytes: Optional[bytes],
+    dpi: int,
+    sig_width: float,
+    sig_height: float,
+    x_offset: float,
+    y_offset: float
+):
+    """Background job to sign PDF."""
+    try:
+        jobs[job_id]['status'] = 'processing'
+        
+        pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
+        pdf_writer = PdfWriter()
+        total_pages = len(pdf_reader.pages)
+        
+        signatures_applied = []
+        all_codes_found = []
+        
+        for page_num in range(1, total_pages + 1):
+            jobs[job_id]['progress'] = f"Processing page {page_num}/{total_pages}"
+            logger.info(f"Job {job_id}: Processing page {page_num}/{total_pages}")
+            
+            original_page = pdf_reader.pages[page_num - 1]
+            page_width = float(original_page.mediabox.width)
+            page_height = float(original_page.mediabox.height)
+            
+            image = convert_single_page(pdf_bytes, page_num, dpi)
+            if image:
+                codes = find_datamatrix_codes(image, dpi=dpi)
+                del image  # Free memory immediately
+                
+                for code in codes:
+                    code['page'] = page_num
+                    all_codes_found.append(code)
+                
+                sig_codes = [c for c in codes if c['data'] in ALL_SIGNATURE_CODES]
+                
+                if sig_codes:
+                    overlay_bytes = create_signature_overlay(
+                        page_width=page_width,
+                        page_height=page_height,
+                        signatures_to_place=sig_codes,
+                        tenant_sig_image=tenant_sig_bytes,
+                        landlord_sig_image=landlord_sig_bytes,
+                        sig_width=sig_width,
+                        sig_height=sig_height,
+                        x_offset=x_offset,
+                        y_offset=y_offset
+                    )
+                    merge_overlay_with_page(original_page, overlay_bytes)
+                    
+                    for sc in sig_codes:
+                        signatures_applied.append({
+                            'page': page_num,
+                            'code': sc['data'],
+                            'x': round(sc['x'], 2),
+                            'y': round(sc['y'], 2)
+                        })
+            
+            pdf_writer.add_page(original_page)
+        
+        output_buffer = io.BytesIO()
+        pdf_writer.write(output_buffer)
+        output_buffer.seek(0)
+        pdf_base64 = base64.b64encode(output_buffer.read()).decode('utf-8')
+        
+        jobs[job_id]['status'] = 'completed'
+        jobs[job_id]['result'] = {
+            "success": True,
+            "total_pages": total_pages,
+            "signatures_applied": signatures_applied,
+            "signatures_count": len(signatures_applied),
+            "all_codes_found": [
+                {"page": c['page'], "data": c['data'], "x": round(c['x'], 2), "y": round(c['y'], 2)}
+                for c in all_codes_found
+            ],
+            "pdf_base64": pdf_base64
+        }
+        logger.info(f"Job {job_id}: Signing completed. Applied {len(signatures_applied)} signatures.")
+        
+    except Exception as e:
+        logger.error(f"Job {job_id} failed: {e}")
+        jobs[job_id]['status'] = 'failed'
+        jobs[job_id]['error'] = str(e)
+
+
 @app.get("/")
 def health_check():
-    return {"status": "healthy", "service": "lease-signer-api"}
+    return {"status": "healthy", "service": "lease-signer-api", "version": "1.1.0"}
+
+
+@app.get("/job/{job_id}")
+def get_job_status(job_id: str):
+    """Check the status of a background job."""
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+    
+    job = jobs[job_id]
+    response = {
+        "job_id": job_id,
+        "status": job['status'],
+        "progress": job.get('progress', '')
+    }
+    
+    if job['status'] == 'completed':
+        response['result'] = job['result']
+    elif job['status'] == 'failed':
+        response['error'] = job.get('error', 'Unknown error')
+    
+    return response
 
 
 @app.post("/scan")
@@ -166,35 +313,29 @@ async def scan_pdf_for_codes(
     dpi: int = Form(default=200)
 ):
     """
-    Scan a PDF and return all DataMatrix codes found with their locations.
-    Useful for debugging/testing before applying signatures.
+    Scan a PDF and return all DataMatrix codes found.
+    Returns a job_id - poll /job/{job_id} to get results.
     """
     if not pdf_file.filename.lower().endswith('.pdf'):
         raise HTTPException(400, "File must be a PDF")
     
     pdf_bytes = await pdf_file.read()
     
-    try:
-        images = convert_from_bytes(pdf_bytes, dpi=dpi)
-    except Exception as e:
-        raise HTTPException(500, f"Failed to convert PDF to images: {e}")
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        'status': 'queued',
+        'progress': 'Starting...',
+        'result': None
+    }
     
-    all_codes = []
-    for page_num, image in enumerate(images, start=1):
-        codes = find_datamatrix_codes(image, dpi=dpi)
-        for code in codes:
-            code['page'] = page_num
-            all_codes.append(code)
-    
-    # Separate signature codes from metadata codes
-    signature_codes = [c for c in all_codes if c['data'] in ALL_SIGNATURE_CODES]
-    metadata_codes = [c for c in all_codes if c['data'] not in ALL_SIGNATURE_CODES]
+    # Run in background thread
+    thread = threading.Thread(target=process_scan_job, args=(job_id, pdf_bytes, dpi))
+    thread.start()
     
     return {
-        "total_pages": len(images),
-        "total_codes_found": len(all_codes),
-        "signature_markers": signature_codes,
-        "metadata_codes": metadata_codes
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Poll /job/{job_id} to check status and get results"
     }
 
 
@@ -211,15 +352,7 @@ async def sign_pdf(
 ):
     """
     Sign a PDF by detecting DataMatrix markers and placing signatures.
-    
-    - pdf_file: The lease PDF with DataMatrix codes
-    - tenant_signature: PNG image for tenant signature (applied to TS_* codes)
-    - landlord_signature: PNG image for landlord signature (applied to LS_* codes)
-    - dpi: Resolution for scanning (higher = more accurate but slower)
-    - sig_width: Width of signature in PDF points (72 points = 1 inch)
-    - sig_height: Height of signature in PDF points
-    - x_offset: Horizontal offset from DataMatrix position
-    - y_offset: Vertical offset from DataMatrix position
+    Returns a job_id - poll /job/{job_id} to get results including base64 PDF.
     """
     if not pdf_file.filename.lower().endswith('.pdf'):
         raise HTTPException(400, "File must be a PDF")
@@ -237,173 +370,64 @@ async def sign_pdf(
     if not tenant_sig_bytes and not landlord_sig_bytes:
         raise HTTPException(400, "At least one signature image must be provided")
     
-    # Convert PDF pages to images for scanning
-    try:
-        images = convert_from_bytes(pdf_bytes, dpi=dpi)
-    except Exception as e:
-        raise HTTPException(500, f"Failed to convert PDF to images: {e}")
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        'status': 'queued',
+        'progress': 'Starting...',
+        'result': None
+    }
     
-    # Read original PDF
-    pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
-    pdf_writer = PdfWriter()
-    
-    signatures_applied = []
-    
-    for page_num, (image, original_page) in enumerate(zip(images, pdf_reader.pages), start=1):
-        # Get page dimensions
-        page_width = float(original_page.mediabox.width)
-        page_height = float(original_page.mediabox.height)
-        
-        # Find DataMatrix codes on this page
-        codes = find_datamatrix_codes(image, dpi=dpi)
-        
-        # Filter to only signature codes
-        sig_codes = [c for c in codes if c['data'] in ALL_SIGNATURE_CODES]
-        
-        if sig_codes:
-            logger.info(f"Page {page_num}: Found {len(sig_codes)} signature markers")
-            
-            # Create overlay with signatures
-            overlay_bytes = create_signature_overlay(
-                page_width=page_width,
-                page_height=page_height,
-                signatures_to_place=sig_codes,
-                tenant_sig_image=tenant_sig_bytes,
-                landlord_sig_image=landlord_sig_bytes,
-                sig_width=sig_width,
-                sig_height=sig_height,
-                x_offset=x_offset,
-                y_offset=y_offset
-            )
-            
-            # Merge overlay onto original page
-            merge_overlay_with_page(original_page, overlay_bytes)
-            
-            for sc in sig_codes:
-                signatures_applied.append({
-                    'page': page_num,
-                    'code': sc['data'],
-                    'x': sc['x'],
-                    'y': sc['y']
-                })
-        
-        pdf_writer.add_page(original_page)
-    
-    # Write output PDF
-    output_buffer = io.BytesIO()
-    pdf_writer.write(output_buffer)
-    output_buffer.seek(0)
-    
-    logger.info(f"Signing complete. Applied {len(signatures_applied)} signatures.")
-    
-    # Return the signed PDF
-    return Response(
-        content=output_buffer.read(),
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f"attachment; filename=signed_{pdf_file.filename}",
-            "X-Signatures-Applied": str(len(signatures_applied)),
-            "X-Signature-Details": str(signatures_applied)
-        }
+    thread = threading.Thread(
+        target=process_sign_job,
+        args=(job_id, pdf_bytes, tenant_sig_bytes, landlord_sig_bytes, dpi, sig_width, sig_height, x_offset, y_offset)
     )
-
-
-@app.post("/sign-with-details")
-async def sign_pdf_with_details(
-    pdf_file: UploadFile = File(...),
-    tenant_signature: Optional[UploadFile] = File(default=None),
-    landlord_signature: Optional[UploadFile] = File(default=None),
-    dpi: int = Form(default=200),
-    sig_width: float = Form(default=100),
-    sig_height: float = Form(default=40),
-    x_offset: float = Form(default=0),
-    y_offset: float = Form(default=-5)
-):
-    """
-    Same as /sign but returns JSON with base64 PDF and detailed results.
-    Useful when you need metadata about what was signed.
-    """
-    import base64
-    
-    if not pdf_file.filename.lower().endswith('.pdf'):
-        raise HTTPException(400, "File must be a PDF")
-    
-    pdf_bytes = await pdf_file.read()
-    
-    tenant_sig_bytes = None
-    landlord_sig_bytes = None
-    
-    if tenant_signature:
-        tenant_sig_bytes = await tenant_signature.read()
-    if landlord_signature:
-        landlord_sig_bytes = await landlord_signature.read()
-    
-    if not tenant_sig_bytes and not landlord_sig_bytes:
-        raise HTTPException(400, "At least one signature image must be provided")
-    
-    try:
-        images = convert_from_bytes(pdf_bytes, dpi=dpi)
-    except Exception as e:
-        raise HTTPException(500, f"Failed to convert PDF to images: {e}")
-    
-    pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
-    pdf_writer = PdfWriter()
-    
-    signatures_applied = []
-    all_codes_found = []
-    
-    for page_num, (image, original_page) in enumerate(zip(images, pdf_reader.pages), start=1):
-        page_width = float(original_page.mediabox.width)
-        page_height = float(original_page.mediabox.height)
-        
-        codes = find_datamatrix_codes(image, dpi=dpi)
-        
-        for code in codes:
-            code['page'] = page_num
-            all_codes_found.append(code)
-        
-        sig_codes = [c for c in codes if c['data'] in ALL_SIGNATURE_CODES]
-        
-        if sig_codes:
-            overlay_bytes = create_signature_overlay(
-                page_width=page_width,
-                page_height=page_height,
-                signatures_to_place=sig_codes,
-                tenant_sig_image=tenant_sig_bytes,
-                landlord_sig_image=landlord_sig_bytes,
-                sig_width=sig_width,
-                sig_height=sig_height,
-                x_offset=x_offset,
-                y_offset=y_offset
-            )
-            
-            merge_overlay_with_page(original_page, overlay_bytes)
-            
-            for sc in sig_codes:
-                signatures_applied.append({
-                    'page': page_num,
-                    'code': sc['data'],
-                    'x': round(sc['x'], 2),
-                    'y': round(sc['y'], 2)
-                })
-        
-        pdf_writer.add_page(original_page)
-    
-    output_buffer = io.BytesIO()
-    pdf_writer.write(output_buffer)
-    output_buffer.seek(0)
-    pdf_base64 = base64.b64encode(output_buffer.read()).decode('utf-8')
+    thread.start()
     
     return {
-        "success": True,
-        "total_pages": len(images),
-        "signatures_applied": signatures_applied,
-        "signatures_count": len(signatures_applied),
-        "all_codes_found": [
-            {"page": c['page'], "data": c['data'], "x": round(c['x'], 2), "y": round(c['y'], 2)}
-            for c in all_codes_found
-        ],
-        "pdf_base64": pdf_base64
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Poll /job/{job_id} to check status and get results"
+    }
+
+
+@app.post("/scan-sync")
+async def scan_pdf_sync(
+    pdf_file: UploadFile = File(...),
+    dpi: int = Form(default=150)
+):
+    """
+    Synchronous scan - use for small PDFs only (< 5 pages).
+    For larger PDFs, use /scan which runs in background.
+    """
+    if not pdf_file.filename.lower().endswith('.pdf'):
+        raise HTTPException(400, "File must be a PDF")
+    
+    pdf_bytes = await pdf_file.read()
+    pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
+    total_pages = len(pdf_reader.pages)
+    
+    if total_pages > 5:
+        raise HTTPException(400, f"PDF has {total_pages} pages. Use /scan endpoint for PDFs with more than 5 pages.")
+    
+    all_codes = []
+    
+    for page_num in range(1, total_pages + 1):
+        image = convert_single_page(pdf_bytes, page_num, dpi)
+        if image:
+            codes = find_datamatrix_codes(image, dpi=dpi)
+            for code in codes:
+                code['page'] = page_num
+                all_codes.append(code)
+            del image
+    
+    signature_codes = [c for c in all_codes if c['data'] in ALL_SIGNATURE_CODES]
+    metadata_codes = [c for c in all_codes if c['data'] not in ALL_SIGNATURE_CODES]
+    
+    return {
+        "total_pages": total_pages,
+        "total_codes_found": len(all_codes),
+        "signature_markers": signature_codes,
+        "metadata_codes": metadata_codes
     }
 
 
