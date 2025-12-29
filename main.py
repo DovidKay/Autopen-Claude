@@ -36,8 +36,8 @@ app = FastAPI(
 # In-memory job storage
 jobs = {}
 
-# Timeout for processing each page (seconds)
-PAGE_TIMEOUT = 30
+# Timeout for processing each page (seconds) - configurable via env var
+PAGE_TIMEOUT = int(os.environ.get("PAGE_TIMEOUT", "60"))
 
 # Signature code mappings
 TENANT_SIGNATURE_CODES = {
