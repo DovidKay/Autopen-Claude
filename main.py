@@ -54,9 +54,9 @@ def find_datamatrix_codes(image: Image.Image, dpi: int = 200, page_height_points
     Find and decode all DataMatrix codes in an image.
     Returns list of dicts with 'data', 'x', 'y', 'width', 'height' in PDF points.
     
-    Note: PDF coordinates have origin at bottom-left, y increases upward.
-    Image coordinates have origin at top-left, y increases downward.
-    pylibdmtx rect.top is the TOP edge of the barcode in image coords.
+    Note: pylibdmtx returns coordinates where rect.top is measured from the
+    BOTTOM of the image (like PDF coordinates), not from the top like typical
+    image coordinates.
     """
     decoded = decode_datamatrix(image)
     
@@ -66,19 +66,15 @@ def find_datamatrix_codes(image: Image.Image, dpi: int = 200, page_height_points
     results = []
     for dm in decoded:
         pixel_left = dm.rect.left
-        pixel_top = dm.rect.top
+        pixel_top = dm.rect.top  # This is actually from BOTTOM of image
         pixel_width = dm.rect.width
         pixel_height = dm.rect.height
         
         # Convert to PDF coordinates
+        # pylibdmtx rect.top is from bottom of image, same as PDF convention
+        # So we can use it directly (just scale to points)
         pdf_x = pixel_left * scale
-        
-        # In image: pixel_top is distance from top of image to top of barcode
-        # In PDF: we want distance from bottom of page to bottom of barcode
-        # pixel_bottom_from_top = pixel_top + pixel_height
-        # pdf_y (from bottom) = page_height - pixel_bottom_from_top (in points)
-        pixel_bottom_from_top = pixel_top + pixel_height
-        pdf_y = page_height_points - (pixel_bottom_from_top * scale)
+        pdf_y = pixel_top * scale  # Direct conversion - both from bottom
         
         pdf_width = pixel_width * scale
         pdf_height = pixel_height * scale
@@ -88,7 +84,7 @@ def find_datamatrix_codes(image: Image.Image, dpi: int = 200, page_height_points
         except:
             data = str(dm.data)
         
-        logger.info(f"DataMatrix '{data}': pixel_top={pixel_top}, pixel_bottom={pixel_bottom_from_top}, image_height={image.height}, pct_from_top={100*pixel_bottom_from_top/image.height:.1f}%")
+        logger.info(f"DataMatrix '{data}': pixel_left={pixel_left}, pixel_top={pixel_top} (from bottom), image_height={image.height}")
         
         results.append({
             'data': data,
@@ -514,6 +510,216 @@ async def scan_pdf_sync(
         "signature_markers": signature_codes,
         "metadata_codes": metadata_codes
     }
+
+
+@app.post("/debug")
+async def debug_visual(
+    pdf: UploadFile = File(...),
+    dpi: int = Form(default=150),
+    page: int = Form(default=0)  # 0 = all pages, or specific page number
+):
+    """
+    Visual debug endpoint - returns HTML page showing detected DataMatrix codes
+    with hover info displaying exact coordinates.
+    """
+    from fastapi.responses import HTMLResponse
+    
+    pdf_bytes = await pdf.read()
+    pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
+    total_pages = len(pdf_reader.pages)
+    scale = 72.0 / dpi
+    
+    # Determine which pages to process
+    if page > 0:
+        pages_to_process = [page]
+    else:
+        pages_to_process = list(range(1, total_pages + 1))
+    
+    pages_html = []
+    
+    for page_num in pages_to_process:
+        if page_num > total_pages:
+            continue
+            
+        # Get page dimensions
+        pdf_page = pdf_reader.pages[page_num - 1]
+        page_width = float(pdf_page.mediabox.width)
+        page_height = float(pdf_page.mediabox.height)
+        
+        # Convert to image
+        images = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=page_num, last_page=page_num)
+        if not images:
+            continue
+        img = images[0]
+        
+        # Detect DataMatrix codes
+        decoded = decode_datamatrix(img)
+        
+        overlays = []
+        code_names = []
+        
+        for dm in decoded:
+            try:
+                code = dm.data.decode('utf-8').strip()
+            except:
+                code = str(dm.data)
+            
+            code_names.append(code)
+            is_signature = code in ALL_SIGNATURE_CODES
+            code_type = "signature" if is_signature else "metadata"
+            
+            pixel_left = dm.rect.left
+            pixel_top = dm.rect.top
+            pixel_width = dm.rect.width
+            pixel_height = dm.rect.height
+            
+            data_info = {
+                'code': code,
+                'pixel_left': pixel_left,
+                'pixel_top': pixel_top,
+                'pixel_width': pixel_width,
+                'pixel_height': pixel_height,
+                'image_height': img.height,
+                'image_width': img.width,
+                'page_height': page_height,
+                'page_width': page_width,
+                'scale': scale,
+            }
+            
+            overlay = f'''<div class="code-overlay {code_type}" 
+                 style="left:{pixel_left}px; top:{pixel_top}px; width:{pixel_width}px; height:{pixel_height}px;"
+                 data-info='{json.dumps(data_info)}'
+                 title="{code}"></div>'''
+            overlays.append(overlay)
+        
+        # Convert image to base64
+        img_buffer = io.BytesIO()
+        img.save(img_buffer, format='PNG')
+        img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+        
+        page_html = f'''
+        <div class="page-container">
+            <div class="page-title">Page {page_num} - {len(decoded)} codes found</div>
+            <div class="coords">
+                Image: {img.width}x{img.height} px | Page: {page_width:.1f}x{page_height:.1f} pts | Scale: {scale:.4f}
+            </div>
+            <div class="image-wrapper" style="width:{img.width}px; height:{img.height}px;">
+                <img src="data:image/png;base64,{img_base64}" width="{img.width}" height="{img.height}">
+                {''.join(overlays)}
+            </div>
+            <div class="coords">
+                Codes found: {', '.join(code_names) if code_names else 'None'}
+            </div>
+        </div>
+        '''
+        pages_html.append(page_html)
+        del img
+    
+    html = f'''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>DataMatrix Debug Viewer</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; background: #1a1a1a; color: #fff; }}
+            h1 {{ color: #4CAF50; }}
+            .page-container {{ margin: 20px 0; background: #2d2d2d; padding: 20px; border-radius: 8px; }}
+            .page-title {{ font-size: 18px; margin-bottom: 10px; color: #81C784; }}
+            .image-wrapper {{ position: relative; display: inline-block; }}
+            .image-wrapper img {{ max-width: 100%; border: 1px solid #444; }}
+            .code-overlay {{
+                position: absolute;
+                border: 3px solid;
+                background: rgba(255,255,255,0.1);
+                cursor: pointer;
+                box-sizing: border-box;
+            }}
+            .code-overlay.signature {{ border-color: #4CAF50; }}
+            .code-overlay.metadata {{ border-color: #2196F3; }}
+            .code-overlay:hover {{ background: rgba(255,255,255,0.3); }}
+            .tooltip {{
+                position: absolute;
+                background: rgba(0,0,0,0.95);
+                color: #fff;
+                padding: 12px;
+                border-radius: 4px;
+                font-size: 13px;
+                z-index: 1000;
+                pointer-events: none;
+                white-space: pre;
+                border: 1px solid #4CAF50;
+                font-family: monospace;
+            }}
+            .legend {{ margin: 20px 0; padding: 15px; background: #2d2d2d; border-radius: 8px; }}
+            .legend span {{ margin-right: 20px; }}
+            .legend .sig {{ color: #4CAF50; }}
+            .legend .meta {{ color: #2196F3; }}
+            .info {{ background: #333; padding: 15px; border-radius: 8px; margin: 10px 0; }}
+            .coords {{ font-family: monospace; background: #1a1a1a; padding: 10px; margin: 10px 0; border-radius: 4px; }}
+        </style>
+    </head>
+    <body>
+        <h1>DataMatrix Debug Viewer</h1>
+        <div class="info">
+            <strong>DPI:</strong> {dpi} | <strong>Scale (72/DPI):</strong> {scale:.4f} | <strong>Total Pages:</strong> {total_pages}
+        </div>
+        <div class="legend">
+            <span class="sig">■ Signature Codes (green)</span>
+            <span class="meta">■ Metadata Codes (blue)</span>
+        </div>
+        
+        {''.join(pages_html)}
+        
+        <div id="tooltip" class="tooltip" style="display:none;"></div>
+        
+        <script>
+            const tooltip = document.getElementById('tooltip');
+            
+            document.querySelectorAll('.code-overlay').forEach(el => {{
+                el.addEventListener('mouseenter', (e) => {{
+                    const d = JSON.parse(el.dataset.info);
+                    const pctFromTop = (d.pixel_top / d.image_height * 100).toFixed(1);
+                    const pctFromBottom = ((d.image_height - d.pixel_top - d.pixel_height) / d.image_height * 100).toFixed(1);
+                    const pdfY_topOrigin = (d.page_height - (d.pixel_top + d.pixel_height) * d.scale).toFixed(1);
+                    const pdfY_bottomOrigin = (d.pixel_top * d.scale).toFixed(1);
+                    
+                    tooltip.innerHTML = `<strong>${{d.code}}</strong>
+
+PIXEL COORDINATES (from pylibdmtx):
+  rect.left:   ${{d.pixel_left}} px
+  rect.top:    ${{d.pixel_top}} px
+  rect.width:  ${{d.pixel_width}} px
+  rect.height: ${{d.pixel_height}} px
+
+IMAGE INFO:
+  Size: ${{d.image_width}} x ${{d.image_height}} px
+  Code is ${{pctFromTop}}% from TOP
+  Code is ${{pctFromBottom}}% from BOTTOM
+
+PDF Y-COORDINATE CALCULATIONS:
+  If rect.top = from IMAGE TOP:
+    pdf_y = ${{pdfY_topOrigin}} pts (from page bottom)
+    
+  If rect.top = from IMAGE BOTTOM:
+    pdf_y = ${{pdfY_bottomOrigin}} pts (from page bottom)`;
+                    tooltip.style.display = 'block';
+                }});
+                
+                el.addEventListener('mousemove', (e) => {{
+                    tooltip.style.left = (e.pageX + 15) + 'px';
+                    tooltip.style.top = (e.pageY + 15) + 'px';
+                }});
+                
+                el.addEventListener('mouseleave', () => {{
+                    tooltip.style.display = 'none';
+                }});
+            }});
+        </script>
+    </body>
+    </html>
+    '''
+    
+    return HTMLResponse(content=html)
 
 
 if __name__ == "__main__":
