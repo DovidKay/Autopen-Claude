@@ -125,8 +125,8 @@ def create_signature_overlay(
     landlord_sig_image: Optional[bytes],
     sig_width: float = 100,
     sig_height: float = 40,
-    x_offset: float = 0,
-    y_offset: float = -5
+    x_offset: float = 30,
+    y_offset: float = 0
 ) -> bytes:
     """Create a PDF page with signature images placed at specified locations."""
     buffer = io.BytesIO()
@@ -409,8 +409,8 @@ async def sign_pdf(
     dpi: int = Form(default=150),
     sig_width: float = Form(default=100),
     sig_height: float = Form(default=40),
-    x_offset: float = Form(default=0),
-    y_offset: float = Form(default=-5)
+    x_offset: float = Form(default=30),
+    y_offset: float = Form(default=0)
 ):
     """
     Sign a PDF by detecting DataMatrix markers and placing signatures.
