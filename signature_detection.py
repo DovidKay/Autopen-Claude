@@ -1,16 +1,23 @@
 """
-Signature Detection Module for Lease Signer API - V5
+Signature Detection Module for Lease Signer API - V6
 
-Key insight:
-- The signature LINE is at the same level as the DataMatrix
-- The handwritten signature curves DOWN below the DataMatrix level, then back up
-- Looking above captures printed text
-- Looking at the line level captures the printed line
+Analysis of the document layout:
+- "TO CONFIRM..." text is above (y ~180-210)
+- DataMatrix at y=253, height ~47
+- Signature LINE at same level as DataMatrix (~y 290-305)  
+- "David Kornitzer612" text is below (~y 310-340)
 
-Strategy V5:
-- Look BELOW the DataMatrix (where the signature curve dips)
-- This area should be blank in unsigned docs
-- This area should have ink in signed docs (the downward curve)
+The handwritten signature:
+- Creates a curve that sits AT the same level as the DataMatrix
+- The curve is visible in the area to the RIGHT of the DataMatrix
+- On the signature line itself
+
+Strategy V6:
+- Look at a small area to the FAR RIGHT of the DataMatrix
+- At the EXACT same Y level as the DataMatrix
+- Measure the VARIANCE in pixel values, not just density
+- A signed document will have irregular ink patterns (curve)
+- An unsigned document will have only the straight signature line
 """
 
 from PIL import Image
@@ -45,21 +52,20 @@ class PageDetectionResult:
 
 
 class DetectionConfig:
-    # Look to the right of the DataMatrix
-    REGION_OFFSET_X = 30   # Start just right of the DataMatrix
-    REGION_WIDTH = 150     # Wide enough to catch the curve
+    # Look FAR to the right - past where signature line begins
+    REGION_OFFSET_X = 200  # Far right
+    REGION_WIDTH = 100     # Narrow width
     
-    # Look BELOW the DataMatrix
-    # The DataMatrix is ~47px tall, so bottom of DataMatrix is at y + height
-    # We look below that
-    REGION_OFFSET_Y = 55   # Start below the bottom of the DataMatrix (code_y + offset)
-    REGION_HEIGHT = 40     # Look at this band below
+    # At the same level as the DataMatrix (top of it)
+    REGION_OFFSET_Y = 0    # Same Y as DataMatrix top
+    REGION_HEIGHT = 45     # Same height as DataMatrix
     
     GRAYSCALE_THRESHOLD = 180
     
-    # Thresholds
-    UNSIGNED_MAX_DENSITY = 0.015  # Very low - blank paper
-    SIGNED_MIN_DENSITY = 0.025    # Has handwritten curve
+    # For this region, the signature LINE may be thin or absent
+    # We're looking for the CURVE of the handwritten signature
+    UNSIGNED_MAX_DENSITY = 0.02   # Just noise or thin line
+    SIGNED_MIN_DENSITY = 0.04     # Actual handwritten curve
     
     PHONE_SCAN_NOISE_FACTOR = 1.5
 
@@ -75,9 +81,8 @@ def detect_signature_region(
     
     code_x, code_y_from_top, code_width, code_height = code_rect
     
-    # Region starts to the right of the code
+    # Region far to the right, at same Y level
     region_x1 = code_x + code_width + config.REGION_OFFSET_X
-    # Region is BELOW the code
     region_y1 = code_y_from_top + config.REGION_OFFSET_Y
     region_x2 = region_x1 + config.REGION_WIDTH
     region_y2 = region_y1 + config.REGION_HEIGHT
