@@ -1,19 +1,22 @@
 """
-Signature Detection Module for Lease Signer API - V10
+Signature Detection Module for Lease Signer API - V11
 
-Key insight: The tenant signature LINE ends before the middle of the page.
-There's a blank zone between the tenant signature area and the landlord area.
+V10 findings:
+- Unsigned: 0.0133 in blank zone (x 426-546)
+- Signed_1: 0.0300 - signature extends to blank zone ✓
+- Signed_2: 0.0052 - signature does NOT extend to blank zone ✗
+- Phone scan: 0.0718 - signature extends to blank zone ✓
 
-- Tenant DataMatrix (TS_MAIN) at x ~80
-- Tenant signature line extends maybe to x ~400-450
-- Blank zone from x ~450-550
-- Landlord DataMatrix (LS_MAIN) at x ~620
+Problem: Not all signatures extend into the far blank zone.
 
-Strategy V10:
-- Look at the blank zone (x ~400-550)
-- At the same Y level as the DataMatrix
-- Unsigned: Completely blank
-- Signed: Signature curve MAY extend into this area
+New approach: Look at region CLOSER to DataMatrix but ABOVE the signature line.
+The signature CURVE goes above the line, while the printed line stays horizontal.
+
+Strategy V11:
+- Look at x: 150-350 (where signature curve is)
+- Look at y: ABOVE the signature line level
+- The signature line is at approximately the BOTTOM of the DataMatrix
+- Look at the TOP half of the DataMatrix region (where curve peaks, line doesn't reach)
 """
 
 from PIL import Image
@@ -48,25 +51,24 @@ class PageDetectionResult:
 
 
 class DetectionConfig:
-    # Look in the blank zone between tenant and landlord areas
-    # Tenant DataMatrix right edge is at ~126 (79+47)
-    # We want to look at x ~380-520 (the blank zone)
-    REGION_OFFSET_X = 300   # 126 + 300 = 426 start
-    REGION_WIDTH = 120      # 426 to 546
+    # Look to the right of DataMatrix where signature curves are
+    REGION_OFFSET_X = 70    # Start past the DataMatrix
+    REGION_WIDTH = 180      # Wide enough to catch curves
     
-    # Same Y level as DataMatrix
-    REGION_OFFSET_Y = 0
-    REGION_HEIGHT = 50
+    # Look at the TOP portion - ABOVE where the signature line is
+    # DataMatrix is at y=253, the signature line is near the bottom of it
+    # The signature CURVE peaks above the line
+    REGION_OFFSET_Y = -5    # Start slightly above DataMatrix top
+    REGION_HEIGHT = 20      # Very narrow - just the top portion where curves are
     
     GRAYSCALE_THRESHOLD = 180
     
-    # In the blank zone:
-    # Unsigned: Should be nearly zero (blank paper)
-    # Signed: If signature extends here, will have some density
-    UNSIGNED_MAX_DENSITY = 0.008  # Very low - just noise
-    SIGNED_MIN_DENSITY = 0.015    # Some ink present
+    # Thresholds for this narrow top region
+    # Should be blank in unsigned, have curve ink in signed
+    UNSIGNED_MAX_DENSITY = 0.015
+    SIGNED_MIN_DENSITY = 0.025
     
-    PHONE_SCAN_NOISE_FACTOR = 2.0  # Higher factor for phone scans
+    PHONE_SCAN_NOISE_FACTOR = 1.5
 
 
 def detect_signature_region(
