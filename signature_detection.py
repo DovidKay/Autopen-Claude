@@ -1,17 +1,17 @@
 """
-Signature Detection Module for Lease Signer API - V3
+Signature Detection Module for Lease Signer API - V4
 
 Key insight from calibration:
-- Looking above the signature line captures printed text
-- Looking at the signature line captures the printed line itself
-- We need to look at a specific spot where ONLY handwritten ink would appear
+- The signature LINE is thick and dark (creates high density)
+- The handwritten signature curves ABOVE this line
+- The text "TO CONFIRM..." is further above
+- We need to look at the narrow gap between the line and the text
 
-Strategy V3:
-- Look at the area to the FAR RIGHT of the DataMatrix
-- At the same Y level as the DataMatrix (not above, not below)
-- This area should have:
-  - Unsigned: just the thin signature line OR blank space
-  - Signed: the curve of the handwritten signature
+Strategy V4:
+- Look at a narrow band JUST ABOVE the signature line
+- Far enough right to avoid the DataMatrix
+- Low enough to avoid the printed text
+- High enough to avoid the signature line itself
 """
 
 from PIL import Image
@@ -46,21 +46,22 @@ class PageDetectionResult:
 
 
 class DetectionConfig:
-    # Look FAR to the right of the DataMatrix
-    # Skip the first ~100px to avoid the start of the signature line
-    REGION_OFFSET_X = 120  # Start further right
-    REGION_WIDTH = 150     # Width of detection region
+    # Start a bit to the right of the DataMatrix (where signature curves are)
+    REGION_OFFSET_X = 60   # Right of DataMatrix
+    REGION_WIDTH = 180     # Wide enough to catch the curve
     
-    # Look at a narrow band at the SAME level as the DataMatrix
-    # (not above where printed text might be)
-    REGION_OFFSET_Y = 5    # Slightly below top of DataMatrix
-    REGION_HEIGHT = 35     # Narrow band
+    # Look ABOVE the DataMatrix/signature line
+    # The signature line is at the bottom of the DataMatrix
+    # We want to look at the area where the handwritten curve goes
+    # Negative Y offset means UP (toward top of image)
+    REGION_OFFSET_Y = -30  # Start 30px above the top of the DataMatrix
+    REGION_HEIGHT = 25     # Narrow band (just above line, below text)
     
     GRAYSCALE_THRESHOLD = 180
     
-    # Thresholds - will need calibration
-    UNSIGNED_MAX_DENSITY = 0.02
-    SIGNED_MIN_DENSITY = 0.04
+    # Thresholds
+    UNSIGNED_MAX_DENSITY = 0.015  # Very low - just noise
+    SIGNED_MIN_DENSITY = 0.025    # Handwritten curve present
     
     PHONE_SCAN_NOISE_FACTOR = 1.5
 
@@ -71,16 +72,14 @@ def detect_signature_region(
     image_height: int,
     config: DetectionConfig = None
 ) -> Tuple[float, Tuple[int, int, int, int]]:
-    """
-    Analyze a region far to the right of the DataMatrix for signature detection.
-    """
     if config is None:
         config = DetectionConfig()
     
     code_x, code_y_from_top, code_width, code_height = code_rect
     
-    # Define the detection region - far to the right, at same Y level
+    # Region starts to the right of the code
     region_x1 = code_x + code_width + config.REGION_OFFSET_X
+    # Region is ABOVE the code (negative offset goes up)
     region_y1 = code_y_from_top + config.REGION_OFFSET_Y
     region_x2 = region_x1 + config.REGION_WIDTH
     region_y2 = region_y1 + config.REGION_HEIGHT
@@ -91,7 +90,6 @@ def detect_signature_region(
     region_x2 = min(page_image.width, region_x2)
     region_y2 = min(page_image.height, region_y2)
     
-    # Extract and analyze the region
     region = page_image.crop((region_x1, region_y1, region_x2, region_y2))
     gray = region.convert('L')
     pixels = np.array(gray)
