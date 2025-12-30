@@ -1,17 +1,19 @@
 """
-Signature Detection Module for Lease Signer API - V8
+Signature Detection Module for Lease Signer API - V9
 
-Problem: The signature LINE density varies between PDF versions.
-The unsigned PDF has a thicker/darker line than the scanned versions.
+The document has:
+- Text "TO CONFIRM..." ending around y ~210-220
+- A gap of blank space
+- Signature LINE starting around y ~290-300
+- Text "David Kornitzer612" below that
 
-New approach: Detect VERTICAL VARIATION in ink patterns.
-- A straight signature line has ink only in a narrow horizontal band
-- A handwritten signature has ink distributed across multiple Y positions
+The handwritten signature creates a CURVE that peaks in the gap (y ~240-280).
+In the unsigned document, this gap should be BLANK.
 
-We analyze the VERTICAL DISTRIBUTION of dark pixels:
-- Calculate the standard deviation of Y-positions of dark pixels
-- High std dev = ink is spread vertically = signature present
-- Low std dev = ink is in a narrow band = just the line
+Strategy V9:
+- Look at a narrow band in the gap between text and signature line
+- y ~250-280 should be blank in unsigned, have ink in signed
+- Go back to simple density measurement in this very specific region
 """
 
 from PIL import Image
@@ -46,21 +48,24 @@ class PageDetectionResult:
 
 
 class DetectionConfig:
-    # Region settings
-    REGION_OFFSET_X = 50    # Start closer to catch full signature
-    REGION_WIDTH = 180      # Wide region
-    REGION_OFFSET_Y = -10   # Start slightly above DataMatrix
-    REGION_HEIGHT = 65      # Taller to capture vertical spread
+    # Look to the right of the DataMatrix
+    REGION_OFFSET_X = 60
+    REGION_WIDTH = 200
+    
+    # Look at the TOP portion of the DataMatrix area
+    # DataMatrix is at y=253, height ~47
+    # We want to look at y ~240-260 (just above/at top of DataMatrix)
+    # This is where the signature CURVE peaks
+    REGION_OFFSET_Y = -15   # Start 15px above the DataMatrix top
+    REGION_HEIGHT = 25      # Very narrow band
     
     GRAYSCALE_THRESHOLD = 180
     
-    # Vertical spread thresholds
-    # A straight line has low vertical std dev (maybe 2-5 pixels)
-    # A signature curve has high vertical std dev (10+ pixels)
-    UNSIGNED_MAX_VERTICAL_STD = 6.0   # Just a straight line
-    SIGNED_MIN_VERTICAL_STD = 10.0    # Has curves
+    # Simple density thresholds
+    UNSIGNED_MAX_DENSITY = 0.01   # Blank area
+    SIGNED_MIN_DENSITY = 0.02     # Has signature curve
     
-    PHONE_SCAN_NOISE_FACTOR = 1.3
+    PHONE_SCAN_NOISE_FACTOR = 1.5
 
 
 def detect_signature_region(
@@ -68,10 +73,7 @@ def detect_signature_region(
     code_rect: Tuple[int, int, int, int],
     image_height: int,
     config: DetectionConfig = None
-) -> Tuple[float, Tuple[int, int, int, int], float]:
-    """
-    Returns: (pixel_density, region_coords, vertical_std)
-    """
+) -> Tuple[float, Tuple[int, int, int, int]]:
     if config is None:
         config = DetectionConfig()
     
@@ -91,54 +93,38 @@ def detect_signature_region(
     gray = region.convert('L')
     pixels = np.array(gray)
     
-    # Find dark pixels
-    dark_mask = pixels < config.GRAYSCALE_THRESHOLD
-    dark_pixels_count = np.sum(dark_mask)
+    dark_pixels = np.sum(pixels < config.GRAYSCALE_THRESHOLD)
     total_pixels = pixels.size
-    pixel_density = dark_pixels_count / total_pixels if total_pixels > 0 else 0
     
-    # Calculate vertical distribution of dark pixels
-    # Get Y coordinates of all dark pixels
-    dark_y_coords = np.where(dark_mask)[0]  # Row indices = Y coordinates
+    pixel_density = dark_pixels / total_pixels if total_pixels > 0 else 0
     
-    if len(dark_y_coords) > 10:  # Need enough pixels for meaningful std
-        vertical_std = np.std(dark_y_coords)
-    else:
-        vertical_std = 0.0  # Not enough ink to analyze
-    
-    return pixel_density, (region_x1, region_y1, region_x2, region_y2), vertical_std
+    return pixel_density, (region_x1, region_y1, region_x2, region_y2)
 
 
 def classify_signature(
     pixel_density: float,
-    vertical_std: float,
     config: DetectionConfig = None,
     is_phone_scan: bool = False
 ) -> Tuple[SignatureStatus, float]:
     if config is None:
         config = DetectionConfig()
     
-    unsigned_max = config.UNSIGNED_MAX_VERTICAL_STD
-    signed_min = config.SIGNED_MIN_VERTICAL_STD
+    unsigned_max = config.UNSIGNED_MAX_DENSITY
+    signed_min = config.SIGNED_MIN_DENSITY
     
     if is_phone_scan:
         unsigned_max *= config.PHONE_SCAN_NOISE_FACTOR
         signed_min *= config.PHONE_SCAN_NOISE_FACTOR
     
-    # Very little ink = unsigned (regardless of spread)
-    if pixel_density < 0.005:
-        return SignatureStatus.UNSIGNED, 0.9
-    
-    # Use vertical spread as primary classifier
-    if vertical_std <= unsigned_max:
-        confidence = 1.0 - (vertical_std / unsigned_max) if unsigned_max > 0 else 1.0
+    if pixel_density <= unsigned_max:
+        confidence = 1.0 - (pixel_density / unsigned_max) if unsigned_max > 0 else 1.0
         return SignatureStatus.UNSIGNED, min(1.0, confidence)
-    elif vertical_std >= signed_min:
-        confidence = min(1.0, (vertical_std - signed_min) / signed_min + 0.7)
+    elif pixel_density >= signed_min:
+        confidence = min(1.0, (pixel_density - signed_min) / signed_min + 0.7)
         return SignatureStatus.SIGNED, confidence
     else:
         range_size = signed_min - unsigned_max
-        position = (vertical_std - unsigned_max) / range_size if range_size > 0 else 0.5
+        position = (pixel_density - unsigned_max) / range_size if range_size > 0 else 0.5
         if position < 0.5:
             return SignatureStatus.UNCERTAIN, 0.5 - position
         else:
@@ -164,17 +150,17 @@ def detect_tenant_signatures(
     unsigned_codes = []
     
     for code_value, code_rect in tenant_codes:
-        pixel_density, region_coords, vertical_std = detect_signature_region(
+        pixel_density, region_coords = detect_signature_region(
             page_image, code_rect, image_height, config
         )
         
-        status, confidence = classify_signature(pixel_density, vertical_std, config, is_phone_scan)
+        status, confidence = classify_signature(pixel_density, config, is_phone_scan)
         
         result = SignatureDetectionResult(
             code=code_value,
             status=status,
             confidence=confidence,
-            pixel_density=vertical_std,  # Store vertical_std in pixel_density field for debugging
+            pixel_density=pixel_density,
             region_coords=region_coords
         )
         results.append(result)
@@ -246,7 +232,7 @@ def process_page_for_signatures(
                 "code": r.code,
                 "status": r.status.value,
                 "confidence": round(r.confidence, 3),
-                "pixel_density": round(r.pixel_density, 4),  # This is actually vertical_std now
+                "pixel_density": round(r.pixel_density, 4),
                 "region": r.region_coords
             }
             for r in result.detection_results
