@@ -1,23 +1,17 @@
 """
-Signature Detection Module for Lease Signer API - V6
+Signature Detection Module for Lease Signer API - V7
 
-Analysis of the document layout:
-- "TO CONFIRM..." text is above (y ~180-210)
-- DataMatrix at y=253, height ~47
-- Signature LINE at same level as DataMatrix (~y 290-305)  
-- "David Kornitzer612" text is below (~y 310-340)
+V6 findings:
+- Unsigned: 0.0107 at x=326-426 ✓
+- Signed_1: 0.0253 - signature doesn't reach this far
+- Signed_2: 0.0009 - signature doesn't reach this far
 
-The handwritten signature:
-- Creates a curve that sits AT the same level as the DataMatrix
-- The curve is visible in the area to the RIGHT of the DataMatrix
-- On the signature line itself
+The signatures don't extend to x=326+. Need to move closer.
 
-Strategy V6:
-- Look at a small area to the FAR RIGHT of the DataMatrix
-- At the EXACT same Y level as the DataMatrix
-- Measure the VARIANCE in pixel values, not just density
-- A signed document will have irregular ink patterns (curve)
-- An unsigned document will have only the straight signature line
+Strategy V7:
+- Move detection region CLOSER to the DataMatrix
+- But still avoid the thick signature line at the beginning
+- Try x offset of 80-100 instead of 200
 """
 
 from PIL import Image
@@ -52,20 +46,21 @@ class PageDetectionResult:
 
 
 class DetectionConfig:
-    # Look FAR to the right - past where signature line begins
-    REGION_OFFSET_X = 200  # Far right
-    REGION_WIDTH = 100     # Narrow width
+    # Closer to DataMatrix than V6, but not right next to it
+    REGION_OFFSET_X = 80   # Closer (was 200 in V6)
+    REGION_WIDTH = 120     # Wider to catch the curve
     
-    # At the same level as the DataMatrix (top of it)
-    REGION_OFFSET_Y = 0    # Same Y as DataMatrix top
-    REGION_HEIGHT = 45     # Same height as DataMatrix
+    # Same Y level as DataMatrix
+    REGION_OFFSET_Y = 0
+    REGION_HEIGHT = 45
     
     GRAYSCALE_THRESHOLD = 180
     
-    # For this region, the signature LINE may be thin or absent
-    # We're looking for the CURVE of the handwritten signature
-    UNSIGNED_MAX_DENSITY = 0.02   # Just noise or thin line
-    SIGNED_MIN_DENSITY = 0.04     # Actual handwritten curve
+    # Adjusted thresholds based on V6 data
+    # Unsigned was 0.0107, Signed_1 was 0.0253
+    # We need to set threshold between these
+    UNSIGNED_MAX_DENSITY = 0.015  # Below this = unsigned
+    SIGNED_MIN_DENSITY = 0.025    # Above this = signed
     
     PHONE_SCAN_NOISE_FACTOR = 1.5
 
@@ -81,13 +76,11 @@ def detect_signature_region(
     
     code_x, code_y_from_top, code_width, code_height = code_rect
     
-    # Region far to the right, at same Y level
     region_x1 = code_x + code_width + config.REGION_OFFSET_X
     region_y1 = code_y_from_top + config.REGION_OFFSET_Y
     region_x2 = region_x1 + config.REGION_WIDTH
     region_y2 = region_y1 + config.REGION_HEIGHT
     
-    # Clamp to image bounds
     region_x1 = max(0, region_x1)
     region_y1 = max(0, region_y1)
     region_x2 = min(page_image.width, region_x2)
