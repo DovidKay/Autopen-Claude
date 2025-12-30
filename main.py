@@ -182,11 +182,16 @@ def process_pdf(
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     
-    # Load signature images
-    landlord_sig = Image.open(io.BytesIO(landlord_sig_bytes))
+    # Load signature images - create fresh BytesIO for each
+    landlord_sig_io = io.BytesIO(landlord_sig_bytes)
+    landlord_sig = Image.open(landlord_sig_io)
+    landlord_sig.load()  # Force load the image data
+    
     tenant_sig = None
     if tenant_sig_bytes:
-        tenant_sig = Image.open(io.BytesIO(tenant_sig_bytes))
+        tenant_sig_io = io.BytesIO(tenant_sig_bytes)
+        tenant_sig = Image.open(tenant_sig_io)
+        tenant_sig.load()  # Force load the image data
     
     # Tracking
     metadata: Optional[LeaseMetadata] = None
@@ -304,14 +309,20 @@ def place_signature(doc, page, rect: Tuple[int, int, int, int], sig_image: Image
 
 def process_job(job_id: str, pdf_bytes: bytes, landlord_sig_bytes: bytes, tenant_sig_bytes: Optional[bytes]):
     """Background job processor"""
+    import traceback
     try:
         jobs[job_id]["status"] = "processing"
+        print(f"[{job_id}] Starting PDF processing...")
         
         # Process the PDF
         signed_pdf, metadata, validation = process_pdf(pdf_bytes, landlord_sig_bytes, tenant_sig_bytes)
         
+        print(f"[{job_id}] PDF processing complete, generating filename...")
+        
         # Generate filename
         output_filename = generate_output_filename(metadata)
+        
+        print(f"[{job_id}] Output filename: {output_filename}")
         
         # Store results
         jobs[job_id].update({
@@ -324,10 +335,15 @@ def process_job(job_id: str, pdf_bytes: bytes, landlord_sig_bytes: bytes, tenant
             "completed_at": datetime.utcnow().isoformat()
         })
         
+        print(f"[{job_id}] Job complete!")
+        
     except Exception as e:
+        error_msg = f"{str(e)}\n{traceback.format_exc()}"
+        print(f"[{job_id}] ERROR: {error_msg}")
         jobs[job_id].update({
             "status": "error",
             "error": str(e),
+            "traceback": traceback.format_exc(),
             "completed_at": datetime.utcnow().isoformat()
         })
 
@@ -364,6 +380,20 @@ async def sign_lease(
     pdf_bytes = await pdf.read()
     landlord_sig_bytes = await landlord_signature.read()
     tenant_sig_bytes = await tenant_signature.read() if tenant_signature else None
+    
+    # Validate files
+    if not pdf_bytes or len(pdf_bytes) < 100:
+        raise HTTPException(status_code=400, detail=f"PDF file is empty or too small ({len(pdf_bytes) if pdf_bytes else 0} bytes)")
+    
+    if not landlord_sig_bytes or len(landlord_sig_bytes) < 100:
+        raise HTTPException(status_code=400, detail=f"Landlord signature file is empty or too small ({len(landlord_sig_bytes) if landlord_sig_bytes else 0} bytes)")
+    
+    # Validate signature is a valid image
+    try:
+        test_img = Image.open(io.BytesIO(landlord_sig_bytes))
+        test_img.verify()  # Verify it's a valid image
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Landlord signature is not a valid image: {str(e)}")
     
     # Initialize job
     jobs[job_id] = {
