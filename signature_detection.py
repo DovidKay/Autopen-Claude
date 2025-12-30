@@ -1,19 +1,19 @@
 """
-Signature Detection Module for Lease Signer API - V9
+Signature Detection Module for Lease Signer API - V10
 
-The document has:
-- Text "TO CONFIRM..." ending around y ~210-220
-- A gap of blank space
-- Signature LINE starting around y ~290-300
-- Text "David Kornitzer612" below that
+Key insight: The tenant signature LINE ends before the middle of the page.
+There's a blank zone between the tenant signature area and the landlord area.
 
-The handwritten signature creates a CURVE that peaks in the gap (y ~240-280).
-In the unsigned document, this gap should be BLANK.
+- Tenant DataMatrix (TS_MAIN) at x ~80
+- Tenant signature line extends maybe to x ~400-450
+- Blank zone from x ~450-550
+- Landlord DataMatrix (LS_MAIN) at x ~620
 
-Strategy V9:
-- Look at a narrow band in the gap between text and signature line
-- y ~250-280 should be blank in unsigned, have ink in signed
-- Go back to simple density measurement in this very specific region
+Strategy V10:
+- Look at the blank zone (x ~400-550)
+- At the same Y level as the DataMatrix
+- Unsigned: Completely blank
+- Signed: Signature curve MAY extend into this area
 """
 
 from PIL import Image
@@ -48,24 +48,25 @@ class PageDetectionResult:
 
 
 class DetectionConfig:
-    # Look to the right of the DataMatrix
-    REGION_OFFSET_X = 60
-    REGION_WIDTH = 200
+    # Look in the blank zone between tenant and landlord areas
+    # Tenant DataMatrix right edge is at ~126 (79+47)
+    # We want to look at x ~380-520 (the blank zone)
+    REGION_OFFSET_X = 300   # 126 + 300 = 426 start
+    REGION_WIDTH = 120      # 426 to 546
     
-    # Look at the TOP portion of the DataMatrix area
-    # DataMatrix is at y=253, height ~47
-    # We want to look at y ~240-260 (just above/at top of DataMatrix)
-    # This is where the signature CURVE peaks
-    REGION_OFFSET_Y = -15   # Start 15px above the DataMatrix top
-    REGION_HEIGHT = 25      # Very narrow band
+    # Same Y level as DataMatrix
+    REGION_OFFSET_Y = 0
+    REGION_HEIGHT = 50
     
     GRAYSCALE_THRESHOLD = 180
     
-    # Simple density thresholds
-    UNSIGNED_MAX_DENSITY = 0.01   # Blank area
-    SIGNED_MIN_DENSITY = 0.02     # Has signature curve
+    # In the blank zone:
+    # Unsigned: Should be nearly zero (blank paper)
+    # Signed: If signature extends here, will have some density
+    UNSIGNED_MAX_DENSITY = 0.008  # Very low - just noise
+    SIGNED_MIN_DENSITY = 0.015    # Some ink present
     
-    PHONE_SCAN_NOISE_FACTOR = 1.5
+    PHONE_SCAN_NOISE_FACTOR = 2.0  # Higher factor for phone scans
 
 
 def detect_signature_region(
