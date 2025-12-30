@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from PIL import Image
 import fitz  # PyMuPDF
@@ -36,6 +36,17 @@ jobs: Dict[str, dict] = {}
 # Detection parameters
 DPI = 150
 SCALE = DPI / 72  # PDF points to pixels
+
+# API Key authentication
+API_KEY = os.environ.get("API_KEY", "")  # Set this in Render environment variables
+
+def verify_api_key(request):
+    """Verify API key from header"""
+    if not API_KEY:
+        return True  # No API key configured, allow all requests
+    
+    provided_key = request.headers.get("X-API-Key", "")
+    return provided_key == API_KEY
 
 
 @dataclass
@@ -376,6 +387,7 @@ async def health():
 
 @app.post("/sign")
 async def sign_lease(
+    request: Request,
     pdf: UploadFile = File(...),
     landlord_signature: UploadFile = File(...),
     tenant_signature: Optional[UploadFile] = File(None)
@@ -384,6 +396,10 @@ async def sign_lease(
     Submit a lease PDF for signing.
     Returns a job_id for status polling.
     """
+    # Verify API key
+    if not verify_api_key(request):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    
     job_id = uuid.uuid4().hex
     
     # Read files
