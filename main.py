@@ -276,26 +276,40 @@ def place_signature(doc, page, rect: Tuple[int, int, int, int], sig_image: Image
     Place signature image on the page.
     
     rect: (left, top, width, height) from pylibdmtx
-    - left: x from left edge
-    - top: y from BOTTOM of image (pylibdmtx convention)
+    - left: x from left edge of image
+    - top: y from BOTTOM of image (pylibdmtx uses bottom-left origin)
+    - width, height: dimensions of the detected code
+    
+    PyMuPDF (fitz) uses TOP-LEFT origin for page coordinates.
+    We need to convert Y coordinate: fitz_y = page_height - pylibdmtx_y
     """
     left, top, width, height = rect
     
-    # Convert to PDF coordinates (72 DPI)
-    # pylibdmtx top is from bottom, same as PDF coordinate system
+    # Get page dimensions in points
+    page_height = page.rect.height
+    
+    # Convert pixel coordinates to PDF points
     pdf_x = left / SCALE
-    pdf_y = top / SCALE  # No conversion needed - both use bottom-left origin
+    code_y_from_bottom = top / SCALE  # pylibdmtx: distance from bottom
     code_width = width / SCALE
     code_height = height / SCALE
+    
+    # Convert Y from bottom-left origin to top-left origin
+    # The code's TOP edge in top-left coordinates
+    pdf_y = page_height - code_y_from_bottom - code_height
     
     # Signature placement: to the LEFT of the code, vertically centered
     sig_width = 100  # points
     sig_height = 40  # points
     
-    sig_x = pdf_x - sig_width - 5  # 5 points gap
-    sig_y = pdf_y + (code_height / 2) - (sig_height / 2)  # Vertically centered
+    sig_x = pdf_x - sig_width - 5  # 5 points gap to the left
+    sig_y = pdf_y + (code_height / 2) - (sig_height / 2)  # Vertically centered with code
     
-    # Create signature rect
+    # Ensure signature doesn't go off-page
+    if sig_x < 5:
+        sig_x = pdf_x + code_width + 5  # Place to the right instead
+    
+    # Create signature rect (x0, y0, x1, y1) - top-left to bottom-right
     sig_rect = fitz.Rect(sig_x, sig_y, sig_x + sig_width, sig_y + sig_height)
     
     # Convert PIL image to bytes
