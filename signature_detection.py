@@ -1,19 +1,20 @@
 """
-Signature Detection Module for Lease Signer API
+Signature Detection Module for Lease Signer API - V2
 
 This module detects whether a tenant has signed (handwritten mark) next to
 their DataMatrix signature marker codes (TS_*).
 
+Key insight from calibration:
+- The unsigned document has a printed signature LINE that creates dark pixels
+- The signed document has handwritten marks ABOVE/ON the signature line
+- We need to detect ink in the area ABOVE the signature line only
+
 Logic:
 1. Find all TS_* DataMatrix codes on the page
-2. For each TS_* code, analyze a region to the RIGHT of the code
-3. Check pixel density in that region - handwritten signatures have more
-   dark pixels than a blank area
+2. For each TS_* code, analyze a region to the RIGHT and ABOVE the code
+   (where handwritten signatures appear, but not where the printed line is)
+3. Check pixel density in that region
 4. Return detection results per code
-
-Based on sample analysis:
-- Unsigned pages: Only DataMatrix code present (clean area to the right)
-- Signed pages: DataMatrix code + handwritten mark to the right
 """
 
 from PIL import Image
@@ -51,23 +52,28 @@ class PageDetectionResult:
 class DetectionConfig:
     # Region to analyze (relative to DataMatrix code position)
     # The handwritten signature appears to the RIGHT of the DataMatrix
+    # and ABOVE the printed signature line
     REGION_OFFSET_X = 10  # pixels to the right of code's right edge
-    REGION_WIDTH = 150  # width of detection region in pixels (increased to capture full signature)
-    REGION_HEIGHT_FACTOR = 1.5  # height relative to DataMatrix height
+    REGION_WIDTH = 200    # width of detection region in pixels
+    
+    # CRITICAL: We look ABOVE the DataMatrix code level
+    # The signature line is at the same Y level as the code
+    # Handwritten marks curve ABOVE this line
+    REGION_OFFSET_Y = -50  # Start above the code (negative = up in image coords)
+    REGION_HEIGHT = 45     # Height of detection region (just the area above the line)
     
     # Thresholds for signature detection
-    # These need calibration with actual samples
     GRAYSCALE_THRESHOLD = 180  # pixels darker than this are "ink"
     
-    # Pixel density thresholds (CALIBRATED based on actual samples)
-    # Unsigned sample: ~0.01-0.02 density (just noise/artifacts)
-    # Signed samples: ~0.04+ density (actual ink marks)
-    UNSIGNED_MAX_DENSITY = 0.025  # Below this = definitely unsigned
-    SIGNED_MIN_DENSITY = 0.035    # Above this = definitely signed
-    # Between these values = uncertain
+    # Pixel density thresholds
+    # In the "above line" region:
+    # - Unsigned: very few dark pixels (just noise) ~0.01-0.02
+    # - Signed: handwritten curves present ~0.03+
+    UNSIGNED_MAX_DENSITY = 0.02   # Below this = definitely unsigned
+    SIGNED_MIN_DENSITY = 0.03     # Above this = definitely signed
     
     # For phone scans (lower quality, more noise)
-    PHONE_SCAN_NOISE_FACTOR = 1.5  # Multiply thresholds by this for phone scans
+    PHONE_SCAN_NOISE_FACTOR = 1.5
 
 
 def detect_signature_region(
@@ -77,32 +83,25 @@ def detect_signature_region(
     config: DetectionConfig = None
 ) -> Tuple[float, Tuple[int, int, int, int]]:
     """
-    Analyze the region to the right of a DataMatrix code for handwritten signature.
+    Analyze the region ABOVE and to the right of a DataMatrix code for handwritten signature.
     
-    Args:
-        page_image: PIL Image of the page
-        code_rect: Bounding box of the DataMatrix code (x, y, width, height)
-                   Note: pylibdmtx rect.top is distance from TOP of image
-        image_height: Total height of the image
-        config: Detection configuration parameters
-    
-    Returns:
-        Tuple of (pixel_density, region_coords)
+    The key insight is that:
+    - The signature LINE is at the same Y level as the DataMatrix
+    - Handwritten signatures curve ABOVE this line
+    - So we look at the area above the code, to the right
     """
     if config is None:
         config = DetectionConfig()
     
     code_x, code_y_from_top, code_width, code_height = code_rect
     
-    # pylibdmtx returns coordinates where rect.top is from the TOP of the image
-    # (standard image coordinates, not PDF coordinates)
-    # So we use code_y_from_top directly
-    
-    # Define the detection region (to the RIGHT of the DataMatrix)
+    # Define the detection region:
+    # - To the RIGHT of the DataMatrix
+    # - ABOVE the DataMatrix level (where handwritten marks appear)
     region_x1 = code_x + code_width + config.REGION_OFFSET_X
-    region_y1 = int(code_y_from_top - (code_height * (config.REGION_HEIGHT_FACTOR - 1) / 2))
+    region_y1 = code_y_from_top + config.REGION_OFFSET_Y  # Above the code
     region_x2 = region_x1 + config.REGION_WIDTH
-    region_y2 = int(region_y1 + code_height * config.REGION_HEIGHT_FACTOR)
+    region_y2 = region_y1 + config.REGION_HEIGHT
     
     # Clamp to image bounds
     region_x1 = max(0, region_x1)
@@ -135,9 +134,6 @@ def classify_signature(
 ) -> Tuple[SignatureStatus, float]:
     """
     Classify whether a signature is present based on pixel density.
-    
-    Returns:
-        Tuple of (status, confidence)
     """
     if config is None:
         config = DetectionConfig()
@@ -152,20 +148,18 @@ def classify_signature(
     
     if pixel_density <= unsigned_max:
         # Clearly unsigned
-        confidence = 1.0 - (pixel_density / unsigned_max)
+        confidence = 1.0 - (pixel_density / unsigned_max) if unsigned_max > 0 else 1.0
         return SignatureStatus.UNSIGNED, min(1.0, confidence)
     
     elif pixel_density >= signed_min:
         # Clearly signed
-        # Higher density = higher confidence (up to a point)
         confidence = min(1.0, (pixel_density - signed_min) / signed_min + 0.7)
         return SignatureStatus.SIGNED, confidence
     
     else:
         # Uncertain range
-        # Calculate how close to each threshold
         range_size = signed_min - unsigned_max
-        position = (pixel_density - unsigned_max) / range_size
+        position = (pixel_density - unsigned_max) / range_size if range_size > 0 else 0.5
         
         if position < 0.5:
             return SignatureStatus.UNCERTAIN, 0.5 - position
@@ -175,23 +169,13 @@ def classify_signature(
 
 def detect_tenant_signatures(
     page_image: Image.Image,
-    detected_codes: List[Tuple[str, Tuple[int, int, int, int]]],  # List of (code_value, rect)
+    detected_codes: List[Tuple[str, Tuple[int, int, int, int]]],
     image_height: int,
     config: DetectionConfig = None,
     is_phone_scan: bool = False
 ) -> PageDetectionResult:
     """
     Detect tenant signatures on a page.
-    
-    Args:
-        page_image: PIL Image of the rendered PDF page
-        detected_codes: List of (code_value, bounding_rect) from DataMatrix detection
-        image_height: Height of the image
-        config: Detection configuration
-        is_phone_scan: Whether this is a phone-scanned document (affects thresholds)
-    
-    Returns:
-        PageDetectionResult with detection results for all TS_* codes
     """
     if config is None:
         config = DetectionConfig()
@@ -227,7 +211,7 @@ def detect_tenant_signatures(
             unsigned_codes.append(code_value)
     
     return PageDetectionResult(
-        page_number=0,  # Set by caller
+        page_number=0,
         tenant_codes_found=[code for code, _ in tenant_codes],
         detection_results=results,
         all_signed=len(unsigned_codes) == 0 and len(tenant_codes) > 0,
@@ -238,53 +222,34 @@ def detect_tenant_signatures(
 def detect_if_phone_scan(page_image: Image.Image) -> bool:
     """
     Heuristic to detect if a page is from a phone scan.
-    
-    Phone scans typically have:
-    - More noise/grain
-    - Slight color cast
-    - Lower contrast
-    - Sometimes visible page edges/shadows
-    
-    This is a simple heuristic - can be improved with more samples.
     """
-    # Convert to grayscale
     gray = np.array(page_image.convert('L'))
     
-    # Check for characteristics of phone scans:
-    
-    # 1. Higher standard deviation in "white" areas (noise)
-    # Sample the corners (usually white/blank)
     h, w = gray.shape
     corner_size = min(50, h // 10, w // 10)
     
     corners = [
-        gray[:corner_size, :corner_size],  # top-left
-        gray[:corner_size, -corner_size:],  # top-right
-        gray[-corner_size:, :corner_size],  # bottom-left
-        gray[-corner_size:, -corner_size:],  # bottom-right
+        gray[:corner_size, :corner_size],
+        gray[:corner_size, -corner_size:],
+        gray[-corner_size:, :corner_size],
+        gray[-corner_size:, -corner_size:],
     ]
     
     corner_stds = [np.std(corner) for corner in corners]
     avg_corner_std = np.mean(corner_stds)
     
-    # Phone scans typically have std > 5 in "white" areas
-    # Clean digital PDFs have std < 2
     if avg_corner_std > 4:
         return True
     
-    # 2. Check if the "white" isn't actually white (color cast)
     corner_means = [np.mean(corner) for corner in corners]
     avg_corner_mean = np.mean(corner_means)
     
-    # Clean PDFs have white backgrounds ~255
-    # Phone scans often have gray-ish backgrounds ~230-250
     if avg_corner_mean < 245:
         return True
     
     return False
 
 
-# Integration function for the main API
 def process_page_for_signatures(
     page_image: Image.Image,
     detected_codes: List[Tuple[str, Tuple[int, int, int, int]]],
@@ -292,23 +257,11 @@ def process_page_for_signatures(
 ) -> Dict:
     """
     Process a single page and return signature detection results.
-    
-    This is the main entry point for integration with the API.
-    
-    Args:
-        page_image: PIL Image of the rendered PDF page
-        detected_codes: List of (code_value, bounding_rect) from pylibdmtx
-        page_number: 1-indexed page number
-    
-    Returns:
-        Dictionary with detection results suitable for API response
     """
     image_height = page_image.height
     
-    # Detect if this is a phone scan
     is_phone_scan = detect_if_phone_scan(page_image)
     
-    # Run detection
     result = detect_tenant_signatures(
         page_image, 
         detected_codes, 
