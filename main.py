@@ -298,16 +298,12 @@ def place_signature(doc, page, rect: Tuple[int, int, int, int], sig_image: Image
     # The code's TOP edge in top-left coordinates
     pdf_y = page_height - code_y_from_bottom - code_height
     
-    # Signature placement: to the LEFT of the code, vertically centered
+    # Signature placement: to the RIGHT of the code, vertically centered
     sig_width = 100  # points
     sig_height = 40  # points
     
-    sig_x = pdf_x - sig_width - 5  # 5 points gap to the left
+    sig_x = pdf_x + code_width + 5  # 5 points gap to the right
     sig_y = pdf_y + (code_height / 2) - (sig_height / 2)  # Vertically centered with code
-    
-    # Ensure signature doesn't go off-page
-    if sig_x < 5:
-        sig_x = pdf_x + code_width + 5  # Place to the right instead
     
     # Create signature rect (x0, y0, x1, y1) - top-left to bottom-right
     sig_rect = fitz.Rect(sig_x, sig_y, sig_x + sig_width, sig_y + sig_height)
