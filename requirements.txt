@@ -7,3 +7,4 @@ Pillow==10.4.0
 pypdf==4.3.1
 reportlab==4.2.2
 numpy==1.26.4
+PyMuPDF
