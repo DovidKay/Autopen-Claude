@@ -336,6 +336,12 @@ def process_job(job_id: str, pdf_bytes: bytes, landlord_sig_bytes: bytes, tenant
 # API Endpoints
 # =============================================================================
 
+@app.get("/")
+async def root():
+    """Root endpoint for Render health check"""
+    return {"status": "healthy", "version": "1.4.0"}
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint"""
