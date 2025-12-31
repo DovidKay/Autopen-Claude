@@ -1,5 +1,5 @@
 """
-Lease Signer API - v1.4.0
+Lease Signer API - v1.5.0
 
 FastAPI microservice for processing lease PDFs:
 - Detects DataMatrix codes
@@ -7,10 +7,9 @@ FastAPI microservice for processing lease PDFs:
 - Places signature images at designated locations
 - Returns structured response with validation info
 
-New in v1.4.0:
-- Dynamic output filename from metadata
-- Structured metadata extraction for n8n logging
-- Validation reporting (missing pages, missing codes)
+New in v1.5.0:
+- Swagger UI Authorize button for API key
+- Improved page validation tracking
 """
 
 import os
@@ -22,13 +21,30 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request, Security, Depends
+from fastapi.security import APIKeyHeader
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from PIL import Image
 import fitz  # PyMuPDF
 from pylibdmtx.pylibdmtx import decode as dmtx_decode
 
-app = FastAPI(title="Lease Signer API", version="1.4.0")
+# API Key authentication
+API_KEY = os.environ.get("API_KEY", "")  # Set this in Render environment variables
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
+    """Verify API key from header"""
+    if not API_KEY:
+        return True  # No API key configured, allow all requests
+    if api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return True
+
+app = FastAPI(
+    title="Lease Signer API", 
+    version="1.5.0",
+    description="API for signing lease PDFs with DataMatrix code detection"
+)
 
 # Job storage
 jobs: Dict[str, dict] = {}
@@ -36,17 +52,6 @@ jobs: Dict[str, dict] = {}
 # Detection parameters
 DPI = 150
 SCALE = DPI / 72  # PDF points to pixels
-
-# API Key authentication
-API_KEY = os.environ.get("API_KEY", "")  # Set this in Render environment variables
-
-def verify_api_key(request):
-    """Verify API key from header"""
-    if not API_KEY:
-        return True  # No API key configured, allow all requests
-    
-    provided_key = request.headers.get("X-API-Key", "")
-    return provided_key == API_KEY
 
 
 @dataclass
@@ -84,6 +89,7 @@ class ValidationResult:
     ls_codes_found: List[str] = field(default_factory=list)
     ts_codes_found: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    page_details: List[dict] = field(default_factory=list)
     
     def to_dict(self) -> dict:
         return {
@@ -93,7 +99,8 @@ class ValidationResult:
             "missing_pages": self.missing_pages,
             "ls_codes_found": self.ls_codes_found,
             "ts_codes_found": self.ts_codes_found,
-            "warnings": self.warnings
+            "warnings": self.warnings,
+            "page_details": self.page_details
         }
 
 
@@ -210,10 +217,12 @@ def process_pdf(
     validation.pages_found = len(doc)
     all_codes_found = []
     pages_with_metadata_codes = []
+    page_details = []  # Track what was found on each page
     
     # Process each page
     for page_num in range(len(doc)):
         page = doc[page_num]
+        page_info = {"page": page_num + 1, "metadata_found": False, "signature_codes": [], "metadata_page_number": None}
         
         # Render page to image
         mat = fitz.Matrix(SCALE, SCALE)
@@ -226,19 +235,28 @@ def process_pdf(
         for code_value, rect in codes:
             all_codes_found.append(code_value)
             
-            # Extract metadata from first metadata code found
+            # Extract metadata from metadata codes
             if is_metadata_code(code_value):
+                page_info["metadata_found"] = True
                 pages_with_metadata_codes.append(page_num + 1)
-                if metadata is None:
-                    metadata = parse_metadata(code_value)
-                    if metadata:
+                
+                # Parse to get the page number from the metadata itself
+                parsed = parse_metadata(code_value)
+                if parsed:
+                    page_info["metadata_page_number"] = parsed.current_page
+                    
+                    # Use first complete metadata for the document
+                    if metadata is None:
+                        metadata = parsed
                         validation.pages_expected = metadata.total_pages
             
             # Track signature codes
             if code_value.startswith('LS_'):
+                page_info["signature_codes"].append(code_value)
                 if code_value not in validation.ls_codes_found:
                     validation.ls_codes_found.append(code_value)
             elif code_value.startswith('TS_'):
+                page_info["signature_codes"].append(code_value)
                 if code_value not in validation.ts_codes_found:
                     validation.ts_codes_found.append(code_value)
             
@@ -249,9 +267,12 @@ def process_pdf(
             # Place tenant signature at TS_* codes (if provided)
             if code_value.startswith('TS_') and tenant_sig:
                 place_signature(doc, page, rect, tenant_sig, pix.height)
+        
+        page_details.append(page_info)
     
     # Validation checks
     validation.pages_with_metadata = pages_with_metadata_codes
+    validation.page_details = page_details
     
     # Check for missing pages (pages without metadata codes)
     if validation.pages_expected > 0:
@@ -376,30 +397,26 @@ def process_job(job_id: str, pdf_bytes: bytes, landlord_sig_bytes: bytes, tenant
 @app.get("/")
 async def root():
     """Root endpoint for Render health check"""
-    return {"status": "healthy", "version": "1.4.0"}
+    return {"status": "healthy", "version": "1.5.0"}
 
 
 @app.get("/health")
 async def health():
     """Health check endpoint"""
-    return {"status": "healthy", "version": "1.4.0"}
+    return {"status": "healthy", "version": "1.5.0"}
 
 
 @app.post("/sign")
 async def sign_lease(
-    request: Request,
     pdf: UploadFile = File(...),
     landlord_signature: UploadFile = File(...),
-    tenant_signature: Optional[UploadFile] = File(None)
+    tenant_signature: Optional[UploadFile] = File(None),
+    authenticated: bool = Depends(verify_api_key)
 ):
     """
     Submit a lease PDF for signing.
     Returns a job_id for status polling.
     """
-    # Verify API key
-    if not verify_api_key(request):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    
     job_id = uuid.uuid4().hex
     
     # Read files
