@@ -50,7 +50,7 @@ app = FastAPI(
 jobs: Dict[str, dict] = {}
 
 # Detection parameters
-DPI = 150
+DPI = 300
 SCALE = DPI / 72  # PDF points to pixels
 
 
@@ -166,7 +166,7 @@ def generate_output_filename(metadata: LeaseMetadata) -> str:
 
 def detect_codes_on_page(page_image: Image.Image) -> List[Tuple[str, Tuple[int, int, int, int]]]:
     """Detect all DataMatrix codes on a page image."""
-    detected = dmtx_decode(page_image, timeout=10000)
+    detected = dmtx_decode(page_image, timeout=30000)  # 30 second timeout for thorough scanning
     results = []
     for d in detected:
         code_value = d.data.decode('utf-8')
